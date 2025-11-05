@@ -18,18 +18,27 @@ SETTINGS_FILE = "node_settings.json"
 class Persistence:
     """Класс для сохранения и загрузки настроек узла"""
     
-    def __init__(self, settings_dir: Optional[str] = None):
+    def __init__(self, settings_dir: Optional[str] = None, node_id: Optional[str] = None):
         """
         Инициализирует модуль сохранения настроек
         
         Args:
             settings_dir: Директория для сохранения настроек (по умолчанию текущая)
+            node_id: Node ID для создания уникального файла настроек (если None - используется SETTINGS_FILE)
         """
-        if settings_dir:
-            self.settings_path = Path(settings_dir) / SETTINGS_FILE
+        if node_id:
+            # Используем node_id для создания уникального файла настроек
+            settings_filename = f"node_settings_{node_id}.json"
         else:
-            self.settings_path = Path(SETTINGS_FILE)
-        debug("PERSISTENCE", f"Файл настроек: {self.settings_path}")
+            settings_filename = SETTINGS_FILE
+        
+        if settings_dir:
+            self.settings_path = Path(settings_dir) / settings_filename
+        else:
+            self.settings_path = Path(settings_filename)
+        
+        self.node_id = node_id
+        debug("PERSISTENCE", f"Файл настроек: {self.settings_path} (node_id={node_id})")
     
     def _protobuf_to_dict(self, pb_msg) -> Dict[str, Any]:
         """Преобразует protobuf сообщение в словарь (сериализует в base64)"""

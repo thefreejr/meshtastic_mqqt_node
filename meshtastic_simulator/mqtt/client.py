@@ -67,6 +67,13 @@ class MQTTClient:
             from meshtastic.protobuf import module_config_pb2
             from ..config import DEFAULT_MQTT_ADDRESS, DEFAULT_MQTT_USERNAME, DEFAULT_MQTT_PASSWORD, DEFAULT_MQTT_ROOT
             
+            # ВАЖНО: Сохраняем старые настройки ДО обновления для корректного сравнения
+            old_broker = self.broker
+            old_port = self.port
+            old_username = self.username
+            old_password = self.password
+            old_root = self.root_topic
+            
             # Обновляем адрес сервера (как в firmware PubSubConfig)
             if hasattr(mqtt_config, 'address') and mqtt_config.address:
                 new_broker = mqtt_config.address.strip()
@@ -83,32 +90,32 @@ class MQTTClient:
                         self.broker = new_broker
                         # Порт определяется из tls_enabled
                         self.port = 8883 if mqtt_config.tls_enabled else 1883
-                    info("MQTT", f"Обновлен адрес сервера: {self.broker}:{self.port}")
+                    info("MQTT", f"Обновлен адрес сервера: {old_broker}:{old_port} -> {self.broker}:{self.port}")
                 else:
                     # Адрес пустой - используем дефолтный (как в firmware)
                     self.broker = DEFAULT_MQTT_ADDRESS
                     self.port = 8883 if mqtt_config.tls_enabled else 1883
-                    info("MQTT", f"Адрес пустой, используем дефолтный: {self.broker}:{self.port}")
+                    info("MQTT", f"Адрес пустой, используем дефолтный: {old_broker}:{old_port} -> {self.broker}:{self.port}")
             else:
                 # Адрес не установлен - используем дефолтный
                 self.broker = DEFAULT_MQTT_ADDRESS
                 self.port = 8883 if mqtt_config.tls_enabled else 1883
-                info("MQTT", f"Адрес не установлен, используем дефолтный: {self.broker}:{self.port}")
+                info("MQTT", f"Адрес не установлен, используем дефолтный: {old_broker}:{old_port} -> {self.broker}:{self.port}")
             
             # Обновляем логин (как в firmware PubSubConfig)
             if hasattr(mqtt_config, 'username') and mqtt_config.username:
                 new_username = mqtt_config.username.strip()
                 if new_username:
                     self.username = new_username
-                    info("MQTT", "Обновлен логин MQTT")
+                    info("MQTT", f"Обновлен логин MQTT: {old_username} -> {self.username}")
                 else:
                     # Логин пустой - используем дефолтный (как в firmware)
                     self.username = DEFAULT_MQTT_USERNAME
-                    info("MQTT", "Логин пустой, используем дефолтный")
+                    info("MQTT", f"Логин пустой, используем дефолтный: {old_username} -> {self.username}")
             else:
                 # Логин не установлен - используем дефолтный
                 self.username = DEFAULT_MQTT_USERNAME
-                debug("MQTT", "Логин не установлен, используем дефолтный")
+                debug("MQTT", f"Логин не установлен, используем дефолтный: {old_username} -> {self.username}")
             
             # Обновляем пароль (как в firmware PubSubConfig)
             if hasattr(mqtt_config, 'password') and mqtt_config.password:
@@ -130,21 +137,30 @@ class MQTTClient:
                 new_root = mqtt_config.root.strip()
                 if new_root:
                     self.root_topic = new_root
-                    info("MQTT", f"Обновлен корневой топик: {self.root_topic}")
+                    info("MQTT", f"Обновлен корневой топик: {old_root} -> {self.root_topic}")
                 else:
                     # Корневой топик пустой - используем дефолтный (как в firmware)
                     self.root_topic = DEFAULT_MQTT_ROOT
-                    info("MQTT", f"Корневой топик пустой, используем дефолтный: {self.root_topic}")
+                    info("MQTT", f"Корневой топик пустой, используем дефолтный: {old_root} -> {self.root_topic}")
             else:
                 # Корневой топик не установлен - используем дефолтный
                 self.root_topic = DEFAULT_MQTT_ROOT
-                debug("MQTT", f"Корневой топик не установлен, используем дефолтный: {self.root_topic}")
+                debug("MQTT", f"Корневой топик не установлен, используем дефолтный: {old_root} -> {self.root_topic}")
             
-            # Переподключаемся если уже подключены
-            if self.connected:
-                info("MQTT", "Переподключение с новыми настройками...")
-                self.stop()
-                time.sleep(1)
+            # Проверяем, изменились ли настройки
+            settings_changed = (old_broker != self.broker or old_port != self.port or 
+                              old_username != self.username or old_password != self.password or 
+                              old_root != self.root_topic)
+            
+            info("MQTT", f"Проверка изменений настроек: changed={settings_changed}, old={old_broker}:{old_port}, new={self.broker}:{self.port}")
+            
+            # Переподключаемся только если настройки действительно изменились
+            if settings_changed:
+                if self.connected:
+                    info("MQTT", "Переподключение с новыми настройками...")
+                    self.stop()
+                    time.sleep(1)
+                # Если не подключен, просто запускаем с новыми настройками
                 return self.start()
             
             return True
@@ -202,17 +218,32 @@ class MQTTClient:
         has_downlink = False
         crypt_topic = f"{self.root_topic}/2/e/"
         
+        # Логируем все каналы для диагностики
+        info("MQTT", f"🔍 Начало подписки на каналы: проверяем {MAX_NUM_CHANNELS} каналов")
+        
         for i in range(MAX_NUM_CHANNELS):
             ch = self.channels.get_by_index(i)
-            if ch.settings.downlink_enabled:
+            channel_id = self.channels.get_global_id(i)
+            downlink_enabled = ch.settings.downlink_enabled
+            
+            # Логируем статус каждого канала
+            if channel_id == "Custom":
+                info("MQTT", f"🔍 Канал {i} (Custom): downlink_enabled={downlink_enabled}")
+            
+            if downlink_enabled:
                 has_downlink = True
-                channel_id = self.channels.get_global_id(i)
                 topic = f"{crypt_topic}{channel_id}/+"
                 result, mid = client.subscribe(topic, qos=1)
                 if result == 0:
-                    info("MQTT", f"Подписан на топик: {topic} (канал {i}: {channel_id})")
+                    if channel_id == "Custom":
+                        info("MQTT", f"✅ ПОДПИСКА НА CUSTOM: topic={topic} (канал {i}: {channel_id})")
+                    else:
+                        info("MQTT", f"Подписан на топик: {topic} (канал {i}: {channel_id})")
                 else:
-                    error("MQTT", f"Ошибка подписки на топик: {topic} (код: {result})")
+                    if channel_id == "Custom":
+                        error("MQTT", f"❌ ОШИБКА ПОДПИСКИ НА CUSTOM: topic={topic} (код: {result})")
+                    else:
+                        error("MQTT", f"Ошибка подписки на топик: {topic} (код: {result})")
         
         if has_downlink:
             topic = f"{crypt_topic}PKI/+"
@@ -225,39 +256,104 @@ class MQTTClient:
     def _on_disconnect(self, client, userdata, rc, properties=None, reasonCode=None):
         """Callback при отключении от MQTT"""
         self.connected = False
-        info("MQTT", "Отключен от брокера")
+        if rc == 0:
+            info("MQTT", "Отключен от брокера (нормальное отключение)")
+        else:
+            warn("MQTT", f"Отключен от брокера (код: {rc})")
     
     def _on_message(self, client, userdata, msg):
         """Обработка входящих MQTT сообщений"""
         # Импортируем весь код обработки из оригинального файла
         # Для упрощения создаем здесь stub, который будет расширен
         try:
+            # Для Custom канала логируем все входящие сообщения
+            topic_str = msg.topic if hasattr(msg, 'topic') else str(msg.topic)
+            payload_size = len(msg.payload) if hasattr(msg, 'payload') else 0
+            
+            # Логируем ВСЕ входящие сообщения (не только debug)
+            # Это важно для диагностики Custom канала
+            if "Custom" in topic_str:
+                info("MQTT", f"🔍 CUSTOM TOPIC ПОЛУЧЕН: topic={topic_str}, payload_size={payload_size}")
+            else:
+                debug("MQTT", f"Получено MQTT сообщение: topic={topic_str}, payload_size={payload_size}")
+            
             envelope = mqtt_pb2.ServiceEnvelope()
             envelope.ParseFromString(msg.payload)
+            
+            debug("MQTT", f"ServiceEnvelope: channel_id={envelope.channel_id}, gateway_id={envelope.gateway_id}, has_packet={envelope.HasField('packet')}")
+            
+            # Для Custom канала добавляем детальное логирование
+            if envelope.channel_id == "Custom":
+                info("MQTT", f"🔍 CUSTOM КАНАЛ ОБНАРУЖЕН: topic={topic_str}, channel_id={envelope.channel_id}, gateway_id={envelope.gateway_id}")
             
             if not envelope.packet or not envelope.channel_id:
                 warn("MQTT", "Неверный ServiceEnvelope: отсутствует packet или channel_id")
                 return
             
-            ch = self.channels.get_by_name(envelope.channel_id)
-            channel_global_id = self.channels.get_global_id(ch.index)
-            
-            channel_allowed = False
+            # Обработка PKI канала
             if envelope.channel_id == "PKI":
                 channel_allowed = True
+                ch = None  # Для PKI канала не нужен объект канала
+                debug("MQTT", f"PKI канал разрешен")
             else:
-                if envelope.channel_id == channel_global_id and ch.settings.downlink_enabled:
-                    channel_allowed = True
+                # Ищем канал по имени (глобальному ID)
+                try:
+                    ch = self.channels.get_by_name(envelope.channel_id)
+                    channel_global_id = self.channels.get_global_id(ch.index)
+                    
+                    debug("MQTT", f"Найден канал: channel_id={envelope.channel_id}, global_id={channel_global_id}, index={ch.index}, downlink_enabled={ch.settings.downlink_enabled}")
+                    
+                    # Для Custom канала добавляем детальное логирование
+                    if envelope.channel_id == "Custom":
+                        debug("MQTT", f"🔍 Custom канал проверка: channel_id={envelope.channel_id}, global_id={channel_global_id}, match={envelope.channel_id.lower() == channel_global_id.lower()}, downlink_enabled={ch.settings.downlink_enabled}")
+                    
+                    # Проверяем, что это тот же канал и downlink включен
+                    if envelope.channel_id.lower() == channel_global_id.lower() and ch.settings.downlink_enabled:
+                        channel_allowed = True
+                        if envelope.channel_id == "Custom":
+                            debug("MQTT", f"✅ Custom канал разрешен для приема")
+                        else:
+                            debug("MQTT", f"Канал '{envelope.channel_id}' разрешен для приема")
+                    else:
+                        channel_allowed = False
+                        if envelope.channel_id == "Custom":
+                            warn("MQTT", f"❌ Custom канал НЕ разрешен: downlink_enabled={ch.settings.downlink_enabled if ch else 'N/A'}, match={envelope.channel_id.lower() == channel_global_id.lower()}")
+                        else:
+                            debug("MQTT", f"Пропуск пакета: канал '{envelope.channel_id}' не разрешен (downlink_enabled={ch.settings.downlink_enabled if ch else 'N/A'}, match={envelope.channel_id.lower() == channel_global_id.lower()})")
+                except Exception as e:
+                    if envelope.channel_id == "Custom":
+                        error("MQTT", f"❌ Custom канал ошибка поиска: {e}")
+                    else:
+                        warn("MQTT", f"Ошибка поиска канала '{envelope.channel_id}': {e}")
+                    import traceback
+                    traceback.print_exc()
+                    channel_allowed = False
             
             if not channel_allowed:
                 debug("MQTT", f"Пропуск пакета: канал '{envelope.channel_id}' не разрешен")
                 return
             
-            if envelope.gateway_id == self.node_id:
-                debug("MQTT", "Игнорируем свой собственный пакет")
+            # Проверяем, не является ли это наш собственный пакет
+            # Сравниваем gateway_id (отправитель) с нашим node_id
+            gateway_id_str = envelope.gateway_id if isinstance(envelope.gateway_id, str) else f"!{envelope.gateway_id:08X}" if isinstance(envelope.gateway_id, int) else str(envelope.gateway_id)
+            our_node_id_str = self.node_id if isinstance(self.node_id, str) else f"!{self.node_id:08X}" if isinstance(self.node_id, int) else str(self.node_id)
+            
+            # Нормализуем для сравнения (убираем ! и приводим к верхнему регистру)
+            gateway_id_normalized = gateway_id_str.replace('!', '').upper()
+            our_node_id_normalized = our_node_id_str.replace('!', '').upper()
+            
+            if gateway_id_normalized == our_node_id_normalized:
+                if envelope.channel_id == "Custom":
+                    info("MQTT", f"🔍 Custom канал: игнорируем свой собственный пакет (gateway_id={gateway_id_str}, наш node_id={our_node_id_str})")
+                else:
+                    debug("MQTT", f"Игнорируем свой собственный пакет (gateway_id={gateway_id_str}, наш node_id={our_node_id_str})")
                 return
             
             info("MQTT", f"Получен пакет от {envelope.gateway_id} на канале {envelope.channel_id}")
+            
+            # Для Custom канала добавляем дополнительное логирование
+            if envelope.channel_id == "Custom":
+                debug("MQTT", f"Custom канал: gateway_id={envelope.gateway_id}, наш node_id={self.node_id}")
             
             packet = mesh_pb2.MeshPacket()
             packet.CopyFrom(envelope.packet)
@@ -343,7 +439,10 @@ class MQTTClient:
                                     continue
                         
                         if not decrypted:
-                            warn("MQTT", f"Не удалось расшифровать пакет (hash={channel_hash})")
+                            if envelope.channel_id == "Custom":
+                                warn("MQTT", f"❌ Custom канал: не удалось расшифровать пакет (hash={channel_hash})")
+                            else:
+                                warn("MQTT", f"Не удалось расшифровать пакет (hash={channel_hash})")
             
             if hasattr(packet, 'via_mqtt'):
                 packet.via_mqtt = True
@@ -362,8 +461,12 @@ class MQTTClient:
             original_channel = packet.channel
             payload_type = packet.WhichOneof('payload_variant')
             
+            # Для Custom канала логируем детали
+            if envelope.channel_id == "Custom":
+                debug("MQTT", f"🔍 Custom канал обработка: payload_type={payload_type}, original_channel={original_channel}, ch.index={ch.index if ch else 'N/A'}")
+            
             if payload_type == 'decoded':
-                if packet.channel != ch.index:
+                if ch and packet.channel != ch.index:
                     packet.channel = ch.index
             elif payload_type == 'encrypted':
                 pass  # Channel для encrypted остается как hash
@@ -459,8 +562,14 @@ class MQTTClient:
             topic = f"{crypt_topic}{channel_id}/{self.node_id}"
             
             if self.connected and self.client:
+                # Для Custom канала добавляем детальное логирование
+                if channel_id == "Custom":
+                    info("MQTT", f"📤 CUSTOM ПАКЕТ ОТПРАВЛЯЕТСЯ: topic={topic}, gateway_id={self.node_id}, channel_id={channel_id}, payload_size={len(payload)}")
                 self.client.publish(topic, payload)
-                info("MQTT", f"Отправлен пакет: {topic} (канал {channel_index}: {channel_id})")
+                if channel_id == "Custom":
+                    info("MQTT", f"✅ CUSTOM ПАКЕТ ОТПРАВЛЕН: topic={topic}")
+                else:
+                    info("MQTT", f"Отправлен пакет: {topic} (канал {channel_index}: {channel_id})")
                 return True
             else:
                 warn("MQTT", "MQTT не подключен, пакет не отправлен")

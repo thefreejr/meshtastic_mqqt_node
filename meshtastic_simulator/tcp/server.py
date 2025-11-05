@@ -8,7 +8,10 @@ import socket
 import struct
 import threading
 import time
+import json
+import os
 from datetime import datetime
+from pathlib import Path
 
 try:
     from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
@@ -27,82 +30,87 @@ except ImportError:
     print("Ошибка: Установите meshtastic: pip install meshtastic")
     raise
 
-from ..config import MAX_NUM_CHANNELS, START1, START2, HEADER_LEN, MAX_TO_FROM_RADIO_SIZE, NodeConfig, DEFAULT_HOP_LIMIT, HOP_MAX
+from ..config import MAX_NUM_CHANNELS, START1, START2, HEADER_LEN, MAX_TO_FROM_RADIO_SIZE, NodeConfig, DEFAULT_HOP_LIMIT, HOP_MAX, DEFAULT_MQTT_ADDRESS, DEFAULT_MQTT_USERNAME, DEFAULT_MQTT_PASSWORD, DEFAULT_MQTT_ROOT
 from ..protocol.stream_api import StreamAPI
 from ..mqtt.client import MQTTClient
 from ..mesh.channels import Channels
 from ..mesh.node_db import NodeDB
-from ..mesh.rtc import RTCQuality, perhaps_set_rtc, get_valid_time, get_rtc_quality
-from ..mesh.config_storage import ConfigStorage
-from ..mesh.persistence import Persistence
+from ..mesh.rtc import RTCQuality, get_valid_time
+from ..tcp.session import TCPConnectionSession
 from ..utils.logger import log, debug, info, warn, error, LogLevel
 
 
 class TCPServer:
-    """TCP сервер для подключения meshtastic python CLI через StreamAPI"""
+    """TCP сервер для подключения meshtastic python CLI через StreamAPI (мультисессионная архитектура)"""
     
-    def __init__(self, port: int, mqtt_client: MQTTClient, channels: Channels, node_db: NodeDB):
+    def __init__(self, port: int, 
+                 default_mqtt_broker: str = DEFAULT_MQTT_ADDRESS,
+                 default_mqtt_port: int = 1883,
+                 default_mqtt_username: str = DEFAULT_MQTT_USERNAME,
+                 default_mqtt_password: str = DEFAULT_MQTT_PASSWORD,
+                 default_mqtt_root: str = DEFAULT_MQTT_ROOT):
+        """
+        Инициализирует TCP сервер для множественных подключений
+        
+        Args:
+            port: TCP порт для прослушивания
+            default_mqtt_broker: Дефолтный MQTT брокер для новых сессий
+            default_mqtt_port: Дефолтный MQTT порт
+            default_mqtt_username: Дефолтный MQTT username
+            default_mqtt_password: Дефолтный MQTT password
+            default_mqtt_root: Дефолтный MQTT root topic
+        """
         self.port = port
-        self.mqtt_client = mqtt_client
-        self.channels = channels
-        self.node_db = node_db
-        self.config_storage = ConfigStorage()  # Хранилище конфигурации
-        self.persistence = Persistence()  # Модуль сохранения настроек
-        # Хранилище шаблонных сообщений (отдельно от CannedMessageConfig)
-        self.canned_messages = ""  # Шаблонные сообщения (разделенные |)
         self.server_socket = None
         self.running = False
-        self.config_sent_nodes = False
         
-        # Определяем наш node_num для использования в ответных пакетах
-        try:
-            self.our_node_num = int(self.mqtt_client.node_id[1:], 16) if self.mqtt_client.node_id.startswith('!') else int(self.mqtt_client.node_id, 16)
-            self.our_node_num = self.our_node_num & 0x7FFFFFFF  # Убираем знак
-        except:
-            self.our_node_num = NodeConfig.FALLBACK_NODE_NUM
+        # Дефолтные настройки MQTT для новых сессий
+        self.default_mqtt_broker = default_mqtt_broker
+        self.default_mqtt_port = default_mqtt_port
+        self.default_mqtt_username = default_mqtt_username
+        self.default_mqtt_password = default_mqtt_password
+        self.default_mqtt_root = default_mqtt_root
         
-        # PKI ключи (Curve25519)
-        self.pki_private_key = None
-        self.pki_public_key = None
-        self._generate_pki_keys()
+        # Активные сессии: dict[client_address] -> TCPConnectionSession
+        self.active_sessions = {}
+        self.sessions_lock = threading.Lock()
         
-        # Хранилище информации о владельце (owner)
-        # Инициализируем значениями из NodeConfig
-        self.owner = mesh_pb2.User()
-        self.owner.id = self.mqtt_client.node_id
-        self.owner.long_name = NodeConfig.USER_LONG_NAME
-        self.owner.short_name = NodeConfig.USER_SHORT_NAME
-        self.owner.is_licensed = False
-        if self.pki_public_key and len(self.pki_public_key) == 32:
-            self.owner.public_key = self.pki_public_key
+        # Маппинг device_id -> node_id для сохранения настроек между переподключениями
+        # device_id уникален для каждого устройства и не меняется
+        self.device_id_to_node_id = {}  # dict[device_id_hex: str] -> node_id: str
+        self.device_id_lock = threading.Lock()
+        
+        # Маппинг IP -> node_id для временной идентификации до получения device_id
+        self.ip_to_node_id = {}  # dict[ip: str] -> node_id: str
+        
+        # Файл для сохранения маппинга device_id -> node_id
+        self.device_id_mapping_file = Path("device_id_mapping.json")
+        self._load_device_id_mapping()
     
-    def _generate_pki_keys(self):
-        """Генерирует Curve25519 ключи для PKI"""
-        if not CRYPTOGRAPHY_AVAILABLE:
-            self.pki_private_key = bytes(32)
-            self.pki_public_key = bytes(32)
-            return
-        
+    def _load_device_id_mapping(self):
+        """Загружает маппинг device_id -> node_id из файла"""
         try:
-            private_key_obj = X25519PrivateKey.generate()
-            self.pki_private_key = private_key_obj.private_bytes_raw()
-            public_key_obj = private_key_obj.public_key()
-            self.pki_public_key = public_key_obj.public_bytes_raw()
-            info("PKI", f"Ключи сгенерированы (public_key: {self.pki_public_key[:8].hex()}...)")
+            if self.device_id_mapping_file.exists():
+                with open(self.device_id_mapping_file, 'r', encoding='utf-8') as f:
+                    self.device_id_to_node_id = json.load(f)
+                info("TCP", f"Загружено {len(self.device_id_to_node_id)} маппингов device_id -> node_id")
+            else:
+                debug("TCP", "Файл маппинга device_id не найден, используем пустой маппинг")
         except Exception as e:
-            error("PKI", f"Ошибка генерации ключей: {e}")
-            import traceback
-            traceback.print_exc()
-            self.pki_private_key = bytes(32)
-            self.pki_public_key = bytes(32)
+            warn("TCP", f"Ошибка загрузки маппинга device_id: {e}")
+            self.device_id_to_node_id = {}
+    
+    def _save_device_id_mapping(self):
+        """Сохраняет маппинг device_id -> node_id в файл"""
+        try:
+            with open(self.device_id_mapping_file, 'w', encoding='utf-8') as f:
+                json.dump(self.device_id_to_node_id, f, indent=2)
+            debug("TCP", f"Сохранено {len(self.device_id_to_node_id)} маппингов device_id -> node_id")
+        except Exception as e:
+            warn("TCP", f"Ошибка сохранения маппинга device_id: {e}")
     
     def start(self):
         """Запускает TCP сервер"""
-        # Загружаем сохраненные настройки при запуске
-        print("🔄 Загрузка сохраненных настроек...")
-        self._load_settings()
-        print("✓ Настройки загружены")
-        
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind(('0.0.0.0', self.port))
@@ -115,15 +123,168 @@ class TCPServer:
             try:
                 client_socket, client_address = self.server_socket.accept()
                 info("TCP", f"Подключение от {client_address[0]}:{client_address[1]}")
+                
+                # Генерируем или получаем node_id для этого клиента
+                # Сначала проверяем IP -> node_id маппинг (временная идентификация)
+                # Затем, после получения device_id из MyInfo, обновим маппинг device_id -> node_id
+                import hashlib
+                
+                client_ip = client_address[0]
+                
+                # Проверяем, есть ли уже node_id для этого IP
+                node_id = None
+                if client_ip in self.ip_to_node_id:
+                    node_id = self.ip_to_node_id[client_ip]
+                    info("TCP", f"Найден node_id для IP {client_ip}: {node_id}")
+                else:
+                    # Генерируем новый node_id на основе IP
+                    client_hash = hashlib.md5(client_ip.encode()).hexdigest()
+                    node_num = int(client_hash[:8], 16) & 0x7FFFFFFF
+                    node_id = f"!{node_num:08X}"
+                    
+                    # Проверяем уникальность node_id среди активных сессий
+                    with self.sessions_lock:
+                        existing_node_ids = {s.node_id for s in self.active_sessions.values()}
+                        if node_id in existing_node_ids:
+                            # Если коллизия - добавляем смещение на основе порта
+                            port_offset = client_address[1] % 1000
+                            node_num = (node_num + port_offset) & 0x7FFFFFFF
+                            node_id = f"!{node_num:08X}"
+                            # Проверяем еще раз
+                            if node_id in existing_node_ids:
+                                import random
+                                node_num = (node_num + random.randint(1, 1000)) & 0x7FFFFFFF
+                                node_id = f"!{node_num:08X}"
+                    
+                    # Сохраняем временный маппинг IP -> node_id
+                    self.ip_to_node_id[client_ip] = node_id
+                    info("TCP", f"Сгенерирован node_id для клиента {client_address[0]}:{client_address[1]}: {node_id}")
+                
+                # Создаем новую сессию для этого клиента
+                session = TCPConnectionSession(
+                    client_socket=client_socket,
+                    client_address=client_address,
+                    node_id=node_id,
+                    server=self  # Передаем ссылку на сервер для обновления маппинга
+                )
+                
+                # Добавляем сессию в активные
+                with self.sessions_lock:
+                    self.active_sessions[client_address] = session
+                
+                # ВАЖНО: Сначала загружаем сохраненные настройки (включая MQTT конфигурацию),
+                # затем создаем MQTT клиент с правильными настройками
+                session._load_settings()
+                
+                # Получаем или создаем MQTT клиент для этой сессии (после загрузки настроек)
+                session.get_or_create_mqtt_client(
+                    default_broker=self.default_mqtt_broker,
+                    default_port=self.default_mqtt_port,
+                    default_username=self.default_mqtt_username,
+                    default_password=self.default_mqtt_password,
+                    default_root=self.default_mqtt_root
+                )
+                
+                # Запускаем обработку клиента в отдельном потоке
                 thread = threading.Thread(
-                    target=self._handle_client,
-                    args=(client_socket, client_address),
+                    target=self._handle_client_session,
+                    args=(session,),
                     daemon=True
                 )
                 thread.start()
             except Exception as e:
                 if self.running:
                     error("TCP", f"Ошибка приема подключения: {e}")
+    
+    def stop(self):
+        """Останавливает TCP сервер"""
+        self.running = False
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except:
+                pass
+        
+        # Закрываем все активные сессии
+        with self.sessions_lock:
+            for session in list(self.active_sessions.values()):
+                session.close()
+            self.active_sessions.clear()
+        
+        info("TCP", "Сервер остановлен")
+    
+    def _handle_client_session(self, session: TCPConnectionSession):
+        """Обрабатывает подключение TCP клиента через сессию"""
+        rx_buffer = bytes()
+        session.client_socket.settimeout(0.1)
+        
+        try:
+            while self.running:
+                try:
+                    # Обрабатываем пакеты из MQTT для этой сессии
+                    if session.mqtt_client:
+                        while not session.mqtt_client.to_client_queue.empty():
+                            response = session.mqtt_client.to_client_queue.get_nowait()
+                            
+                            try:
+                                from_radio_data = StreamAPI.remove_framing(response)
+                                if from_radio_data:
+                                    from_radio = mesh_pb2.FromRadio()
+                                    from_radio.ParseFromString(from_radio_data)
+                                    if from_radio.HasField('packet'):
+                                        session._handle_mqtt_packet(from_radio.packet)
+                            except:
+                                pass
+                            
+                            session.client_socket.send(response)
+                except queue.Empty:
+                    pass
+                except Exception as e:
+                    error("TCP", f"[{session._log_prefix()}] Ошибка отправки пакета клиенту: {e}")
+                
+                try:
+                    data = session.client_socket.recv(4096)
+                    if not data:
+                        break
+                    
+                    rx_buffer += data
+                    
+                    while len(rx_buffer) >= HEADER_LEN:
+                        if rx_buffer[0] != START1 or rx_buffer[1] != START2:
+                            rx_buffer = rx_buffer[1:]
+                            continue
+                        
+                        length = struct.unpack('>H', rx_buffer[2:4])[0]
+                        if length > MAX_TO_FROM_RADIO_SIZE:
+                            rx_buffer = rx_buffer[1:]
+                            continue
+                        
+                        if len(rx_buffer) < HEADER_LEN + length:
+                            break
+                        
+                        payload = rx_buffer[HEADER_LEN:HEADER_LEN + length]
+                        rx_buffer = rx_buffer[HEADER_LEN + length:]
+                        
+                        session._handle_to_radio(payload)
+                
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    error("TCP", f"[{session._log_prefix()}] Ошибка чтения от клиента: {e}")
+                    break
+        
+        except Exception as e:
+            error("TCP", f"[{session._log_prefix()}] Ошибка обработки клиента: {e}")
+        finally:
+            session.client_socket.close()
+            
+            # Удаляем сессию из активных
+            with self.sessions_lock:
+                if session.client_address in self.active_sessions:
+                    del self.active_sessions[session.client_address]
+            
+            session.close()
+            info("TCP", f"[{session._log_prefix()}] Клиент {session.client_address[0]}:{session.client_address[1]} отключен")
     
     def _handle_client(self, client_socket: socket.socket, client_address):
         """Обрабатывает подключение TCP клиента"""
@@ -887,17 +1048,9 @@ class TCPServer:
                 info("ADMIN", f"Отправлен ответ get_device_metadata_response (request_id={packet.id})")
             
             elif admin_msg.HasField('set_time_only'):
-                # Клиент отправляет Unix timestamp для синхронизации времени (как в firmware)
-                from ..mesh.rtc import RTCSetResult
-                timestamp = admin_msg.set_time_only
-                result = perhaps_set_rtc(RTCQuality.NTP, timestamp, force_update=False)
-                dt = datetime.fromtimestamp(timestamp)
-                if result == RTCSetResult.SUCCESS:
-                    info("ADMIN", f"Синхронизация времени: {dt.strftime('%Y-%m-%d %H:%M:%S')} (timestamp: {timestamp})")
-                elif result == RTCSetResult.INVALID_TIME:
-                    warn("ADMIN", f"Невалидное время: {dt.strftime('%Y-%m-%d %H:%M:%S')} (timestamp: {timestamp})")
-                else:
-                    debug("ADMIN", f"Время не установлено (качество недостаточно): {result.name}")
+                # Этот метод больше не используется - обработка перенесена в TCPConnectionSession
+                # Оставлено для совместимости, но не должно вызываться
+                warn("ADMIN", "set_time_only вызван в старом методе TCPServer (должен обрабатываться в сессии)")
                 
         except Exception as e:
             error("ADMIN", f"Ошибка обработки AdminMessage: {e}")

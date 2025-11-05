@@ -1,0 +1,84 @@
+{
+  "channels": [
+    {
+      "index": 0,
+      "role": 1,
+      "name": "LongFast",
+      "psk": "1PG7OiApB1nwvP+rz05pAQ==",
+      "radio": null,
+      "uplink_enabled": true,
+      "downlink_enabled": true
+    },
+    {
+      "index": 1,
+      "role": 2,
+      "name": "",
+      "psk": "PhvQ5A9CkSL0RnGZgkQkSWO8S81A6KIlaoxl4LsTqDU=",
+      "radio": null,
+      "uplink_enabled": true,
+      "downlink_enabled": true
+    },
+    {
+      "index": 2,
+      "role": 0,
+      "name": "",
+      "psk": "",
+      "radio": null,
+      "uplink_enabled": false,
+      "downlink_enabled": false
+    },
+    {
+      "index": 3,
+      "role": 0,
+      "name": "",
+      "psk": "",
+      "radio": null,
+      "uplink_enabled": false,
+      "downlink_enabled": false
+    },
+    {
+      "index": 4,
+      "role": 0,
+      "name": "",
+      "psk": "",
+      "radio": null,
+      "uplink_enabled": false,
+      "downlink_enabled": false
+    },
+    {
+      "index": 5,
+      "role": 0,
+      "name": "",
+      "psk": "",
+      "radio": null,
+      "uplink_enabled": false,
+      "downlink_enabled": false
+    },
+    {
+      "index": 6,
+      "role": 0,
+      "name": "",
+      "psk": "",
+      "radio": null,
+      "uplink_enabled": false,
+      "downlink_enabled": false
+    },
+    {
+      "index": 7,
+      "role": 0,
+      "name": "",
+      "psk": "",
+      "radio": null,
+      "uplink_enabled": false,
+      "downlink_enabled": false
+    }
+  ],
+  "owner": {
+    "_type": "meshtastic.protobuf.User",
+    "_data": "CgkhRkI1NzBFNUQSCU1RVFQgTm9kZRoEVVJBYUIgM78frcPAzpq8JP1SmDGwADYdSSGqvbhJ3UVu/vv1LCxIAA=="
+  },
+  "module_config": {
+    "_type": "meshtastic.protobuf.ModuleConfig",
+    "_data": "CgQIAVoA"
+  }
+}

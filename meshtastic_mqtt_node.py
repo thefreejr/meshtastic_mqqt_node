@@ -17,13 +17,10 @@ import time
 # Импорты из новой модульной структуры
 from meshtastic_simulator.config import (
     DEFAULT_MQTT_ADDRESS, DEFAULT_MQTT_USERNAME, DEFAULT_MQTT_PASSWORD, 
-    DEFAULT_MQTT_ROOT, MAX_NUM_CHANNELS, DEFAULT_LOG_LEVEL, DEFAULT_LOG_CATEGORIES
+    DEFAULT_MQTT_ROOT, DEFAULT_LOG_LEVEL, DEFAULT_LOG_CATEGORIES
 )
 from meshtastic_simulator.utils.logger import set_log_level, set_log_categories, LogLevel
-from meshtastic_simulator.mesh import Channels, NodeDB, generate_node_id
-from meshtastic_simulator.mqtt import MQTTClient
 from meshtastic_simulator.tcp import TCPServer
-from meshtastic.protobuf import channel_pb2
 
 
 def main():
@@ -50,7 +47,7 @@ def main():
     parser.add_argument('--mqtt-root', default=DEFAULT_MQTT_ROOT,
                        help=f'MQTT корневой топик (по умолчанию: {DEFAULT_MQTT_ROOT})')
     parser.add_argument('--node-id', default=None,
-                       help='Node ID (по умолчанию: автогенерация)')
+                       help='Node ID (deprecated: each session now generates its own node_id)')
     parser.add_argument('--tcp-port', type=int, default=4403,
                        help='TCP порт (по умолчанию: 4403)')
     parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARN', 'ERROR', 'NONE'],
@@ -77,55 +74,24 @@ def main():
         # Используем настройку из config.py
         set_log_categories(DEFAULT_LOG_CATEGORIES)
     
-    # Генерируем Node ID если не указан
-    node_id = args.node_id or generate_node_id()
-    
     print("="*70)
-    print("Meshtastic MQTT Node Simulator")
+    print("Meshtastic MQTT Node Simulator (Multi-Session)")
     print("="*70)
-    print(f"Node ID: {node_id}")
-    print(f"MQTT: {args.mqtt_broker}:{args.mqtt_port}")
+    print(f"MQTT Defaults: {args.mqtt_broker}:{args.mqtt_port}")
     print(f"TCP: localhost:{args.tcp_port}")
+    print("  (Each client will get its own node_id and settings)")
     print()
     
-    # Получаем node_num из node_id
-    try:
-        node_num = int(node_id[1:], 16) if node_id.startswith('!') else int(node_id, 16)
-    except:
-        node_num = 0x12345678
-    
-    # Создаем каналы
-    channels = Channels()
-    
-    # Логируем hash каналов для проверки
-    for i in range(MAX_NUM_CHANNELS):
-        ch = channels.get_by_index(i)
-        if ch.role != channel_pb2.Channel.Role.DISABLED:
-            ch_hash = channels.get_hash(i)
-            ch_name = channels.get_global_id(i)
-            print(f"📊 Канал {i} ({ch_name}): hash={ch_hash} (0x{ch_hash:02x})")
-    
-    # Создаем NodeDB
-    node_db = NodeDB(our_node_num=node_num)
-    
-    # Создаем MQTT клиент
-    mqtt_client = MQTTClient(
-        broker=args.mqtt_broker,
-        port=args.mqtt_port,
-        username=args.mqtt_username,
-        password=args.mqtt_password,
-        root_topic=args.mqtt_root,
-        node_id=node_id,
-        channels=channels,
-        node_db=node_db
+    # Создаем TCP сервер (мультисессионная архитектура)
+    # Каждая сессия создает свои компоненты (channels, node_db, mqtt_client)
+    tcp_server = TCPServer(
+        port=args.tcp_port,
+        default_mqtt_broker=args.mqtt_broker,
+        default_mqtt_port=args.mqtt_port,
+        default_mqtt_username=args.mqtt_username,
+        default_mqtt_password=args.mqtt_password,
+        default_mqtt_root=args.mqtt_root
     )
-    
-    if not mqtt_client.start():
-        print("✗ Не удалось подключиться к MQTT")
-        return 1
-    
-    # Создаем TCP сервер
-    tcp_server = TCPServer(port=args.tcp_port, mqtt_client=mqtt_client, channels=channels, node_db=node_db)
     tcp_thread = threading.Thread(target=tcp_server.start, daemon=True)
     tcp_thread.start()
     
@@ -139,7 +105,6 @@ def main():
     except KeyboardInterrupt:
         print("\n\n⚠ Остановка...")
         tcp_server.stop()
-        mqtt_client.stop()
         print("✓ Остановлено")
         return 0
 
