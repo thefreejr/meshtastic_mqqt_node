@@ -11,6 +11,7 @@ Meshtastic MQTT Node Simulator
 """
 
 import argparse
+import socket
 import threading
 import time
 
@@ -22,6 +23,26 @@ from meshtastic_simulator.config import (
 )
 from meshtastic_simulator.utils.logger import set_log_level, set_log_categories, set_log_file, LogLevel
 from meshtastic_simulator.tcp import TCPServer
+
+
+def get_local_ip() -> str:
+    """Получает локальный IP адрес для подключения из сети"""
+    try:
+        # Подключаемся к внешнему адресу (не отправляем данные)
+        # Это нужно чтобы определить IP адрес сетевого интерфейса
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0)
+        try:
+            # Не отправляем данные, просто определяем интерфейс
+            s.connect(('8.8.8.8', 80))
+            ip = s.getsockname()[0]
+        except Exception:
+            ip = '127.0.0.1'
+        finally:
+            s.close()
+        return ip
+    except Exception:
+        return '127.0.0.1'
 
 
 def main():
@@ -80,11 +101,14 @@ def main():
         set_log_file(DEFAULT_LOG_FILE)
         print(f"📝 Логи записываются в файл: {DEFAULT_LOG_FILE}")
     
+    # Получаем локальный IP адрес
+    local_ip = get_local_ip()
+    
     print("="*70)
     print("Meshtastic MQTT Node Simulator (Multi-Session)")
     print("="*70)
     print(f"MQTT Defaults: {args.mqtt_broker}:{args.mqtt_port}")
-    print(f"TCP: localhost:{args.tcp_port}")
+    print(f"TCP: {local_ip}:{args.tcp_port} (0.0.0.0:{args.tcp_port})")
     print("  (Each client will get its own node_id and settings)")
     print()
     
@@ -102,7 +126,9 @@ def main():
     tcp_thread.start()
     
     print("\n✓ Сервер запущен")
-    print(f"  Подключение: meshtastic --host localhost:{args.tcp_port}")
+    print(f"  Локальное подключение: meshtastic --host localhost:{args.tcp_port}")
+    if local_ip != '127.0.0.1':
+        print(f"  Сетевое подключение: meshtastic --host {local_ip}:{args.tcp_port}")
     print("\n👂 Ожидание подключений... (Ctrl+C для выхода)\n")
     
     try:

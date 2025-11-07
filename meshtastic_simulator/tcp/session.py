@@ -103,6 +103,9 @@ class TCPConnectionSession:
         
         # Флаг для отслеживания отправки config
         self.config_sent_nodes = False
+        
+        # Флаг для предотвращения повторного закрытия
+        self._closed = False
     
     def _log_prefix(self) -> str:
         """Возвращает префикс для логов с node_id и именем пользователя"""
@@ -776,6 +779,12 @@ class TCPConnectionSession:
     
     def close(self) -> None:
         """Закрывает сессию и очищает ресурсы"""
+        # Защита от повторного закрытия
+        if self._closed:
+            return
+        
+        self._closed = True
+        
         # Останавливаем MQTT клиент ПЕРЕД закрытием сокета
         if self.mqtt_client:
             try:

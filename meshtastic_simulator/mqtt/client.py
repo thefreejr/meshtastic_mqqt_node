@@ -40,6 +40,9 @@ class MQTTClient:
         self.connection = None
         self.subscription = MQTTSubscription(root_topic, channels, node_id)
         self.packet_processor = MQTTPacketProcessor(node_id, channels, node_db)
+        
+        # Флаг для предотвращения повторной остановки
+        self._stopped = False
     
     def update_config(self, mqtt_config):
         """
@@ -161,8 +164,8 @@ class MQTTClient:
         # Создаем callback для подписки
         def on_connect_callback(client, userdata, flags, rc, properties=None, reasonCode=None):
             if rc == 0:
-                info("MQTT", f"Подключен к {self.broker}:{self.port}")
-                # РџРѕРґРїРёСЃС‹РІР°РµРјСЃСЏ РЅР° РєР°РЅР°Р»С‹
+                # Сообщение о подключении уже выводится в MQTTConnection._on_connect
+                # Подписываемся на каналы
                 self.subscription.subscribe_to_channels(client)
         
         # Создаем callback для обработки сообщений
@@ -256,6 +259,12 @@ class MQTTClient:
     
     def stop(self):
         """Останавливает MQTT клиент"""
+        # Защита от повторной остановки
+        if self._stopped:
+            return
+        
+        self._stopped = True
+        
         if self.connection:
             try:
                 self.connection.disconnect()

@@ -79,7 +79,7 @@
   },
   "module_config": {
     "_type": "meshtastic.protobuf.ModuleConfig",
-    "_data": "CjMIARITbXF0dC5tZXNodGFzdGljLm9yZxoHbWVzaGRldiIKbGFyZ2U0Y2F0cygBQgNtc2g="
+    "_data": "CiIIARINMTk1LjEzMy43NS4zMRoCbjEiAm4xKAFCA21zaFoA"
   },
   "owner": null
 }
