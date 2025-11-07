@@ -13,7 +13,7 @@ services:
     
     # Volumes для конфигурации, логов и данных
     volumes:
-      - ./mosquitto/config:/mosquitto/config:rw
+      - ./mosquitto/config:/mosquitto/config:ro
       - ./mosquitto/logs:/mosquitto/logs:rw
       - ./mosquitto/data:/mosquitto/data:rw
     
@@ -24,13 +24,7 @@ services:
         max-size: "10m"
         max-file: "3"
     
-    # Healthcheck
-    healthcheck:
-      test: ["CMD", "mosquitto_sub", "-h", "localhost", "-t", "$$SYS/health", "-C", "1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
+
 
   meshtastic-node:
     build:
@@ -71,10 +65,3 @@ services:
         max-size: "10m"
         max-file: "3"
     
-    # Healthcheck (опционально)
-    healthcheck:
-      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.connect(('localhost', 4403)); s.close()"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
