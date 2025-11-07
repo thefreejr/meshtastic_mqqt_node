@@ -12,7 +12,7 @@ except ImportError:
     print("Ошибка: Установите paho-mqtt: pip install paho-mqtt")
     raise
 
-from ..utils.logger import info, error, warn
+from ..utils.logger import info, error, warn, debug
 
 
 class MQTTConnection:
@@ -70,7 +70,12 @@ class MQTTConnection:
             self.client = mqtt.Client(client_id=self.node_id)
         
         # Устанавливаем учетные данные
+        if not self.username:
+            warn("MQTT", "Username is empty, connection may fail")
+        if not self.password:
+            warn("MQTT", "Password is empty, connection may fail")
         self.client.username_pw_set(self.username, self.password)
+        debug("MQTT", f"Setting credentials: username='{self.username}', password_length={len(self.password) if self.password else 0}")
         
         # Устанавливаем callbacks
         self.client.on_connect = self._on_connect
@@ -125,8 +130,14 @@ class MQTTConnection:
         """Callback при отключении от MQTT"""
         self.connected = False
         
-        # В MQTT v5 может быть reasonCode вместо rc
-        result_code = reasonCode if reasonCode is not None else rc
+        # В MQTT v5 может быть reasonCode в properties или как отдельный параметр
+        # Если properties - это объект с reasonCode, извлекаем его
+        if properties is not None and hasattr(properties, 'reasonCode'):
+            result_code = properties.reasonCode
+        elif reasonCode is not None:
+            result_code = reasonCode
+        else:
+            result_code = rc
         
         # Обрабатываем случаи, когда код может быть None или неожиданным типом
         if result_code is None:
@@ -160,19 +171,80 @@ class MQTTConnection:
             5: "Not authorized",
         }
         
+        # MQTT v5 reason codes (расширенные)
+        mqtt_v5_errors = {
+            128: "Unspecified error",
+            129: "Malformed packet",
+            130: "Protocol error",
+            131: "Implementation specific error",
+            132: "Unsupported protocol version",
+            133: "Client identifier not valid",
+            134: "Bad username or password",
+            135: "Not authorized",
+            136: "Server unavailable",
+            137: "Server busy",
+            138: "Banned",
+            139: "Server shutting down",
+            140: "Bad authentication method",
+            141: "Keep alive timeout",
+            142: "Session taken over",
+            143: "Topic filter invalid",
+            144: "Topic name invalid",
+            145: "Packet identifier in use",
+            146: "Packet identifier not found",
+            147: "Receive maximum exceeded",
+            148: "Topic alias invalid",
+            149: "Packet too large",
+            150: "Message rate too high",
+            151: "Quota exceeded",
+            152: "Administrative action",
+            153: "Payload format invalid",
+            154: "Retain not supported",
+            155: "QoS not supported",
+            156: "Use another server",
+            157: "Server moved",
+            158: "Shared subscriptions not supported",
+            159: "Connection rate exceeded",
+            160: "Maximum connect time",
+            161: "Subscription identifiers not supported",
+            162: "Wildcard subscriptions not supported",
+        }
+        
         # Если код - строка (как в некоторых версиях paho-mqtt)
         if isinstance(code, str):
             return code
         
         # Если код - число
         if isinstance(code, int):
-            return mqtt_errors.get(code, f"Unknown error (code: {code})")
+            # Проверяем сначала стандартные коды, затем MQTT v5
+            if code in mqtt_errors:
+                return mqtt_errors[code]
+            elif code in mqtt_v5_errors:
+                return mqtt_v5_errors[code]
+            else:
+                return f"Unknown error (code: {code})"
         
         # Если это объект с атрибутами (MQTT v5)
         if hasattr(code, 'name'):
             return code.name
         if hasattr(code, 'value'):
+            # Если value - число, проверяем в словарях
+            if isinstance(code.value, int):
+                if code.value in mqtt_errors:
+                    return mqtt_errors[code.value]
+                elif code.value in mqtt_v5_errors:
+                    return mqtt_v5_errors[code.value]
             return str(code.value)
+        
+        # Если это объект Properties, пытаемся извлечь reasonCode
+        if hasattr(code, 'reasonCode'):
+            reason = code.reasonCode
+            if isinstance(reason, int):
+                if reason in mqtt_errors:
+                    return mqtt_errors[reason]
+                elif reason in mqtt_v5_errors:
+                    return mqtt_v5_errors[reason]
+            return str(reason)
         
         return f"Unknown error type: {type(code).__name__}"
     

@@ -108,15 +108,15 @@ class MQTTClient:
                 new_password = mqtt_config.password.strip()
                 if new_password:
                     self.password = new_password
-                    info("MQTT", "Updated MQTT password")
+                    info("MQTT", f"Updated MQTT password (length: {len(new_password)})")
                 else:
                     # Пароль пустой - используем дефолтный (как в firmware)
                     self.password = DEFAULT_MQTT_PASSWORD
-                    info("MQTT", "Password empty, using default")
+                    info("MQTT", f"Password empty, using default (length: {len(DEFAULT_MQTT_PASSWORD) if DEFAULT_MQTT_PASSWORD else 0})")
             else:
                 # Пароль не установлен - используем дефолтный
                 self.password = DEFAULT_MQTT_PASSWORD
-                debug("MQTT", "Password not set, using default")
+                debug("MQTT", f"Password not set, using default (length: {len(DEFAULT_MQTT_PASSWORD) if DEFAULT_MQTT_PASSWORD else 0})")
             
             # Обновляем корневой топик (как в firmware)
             if hasattr(mqtt_config, 'root') and mqtt_config.root:
