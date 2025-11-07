@@ -76,74 +76,74 @@ class MQTTClient:
                         self.broker = new_broker
                         # Порт определяется из tls_enabled
                         self.port = 8883 if mqtt_config.tls_enabled else 1883
-                    info("MQTT", f"Обновлен адрес сервера: {old_broker}:{old_port} -> {self.broker}:{self.port}")
+                    info("MQTT", f"Updated server address: {old_broker}:{old_port} -> {self.broker}:{self.port}")
                 else:
                     # Адрес пустой - используем дефолтный (как в firmware)
                     self.broker = DEFAULT_MQTT_ADDRESS
                     self.port = 8883 if mqtt_config.tls_enabled else 1883
-                    info("MQTT", f"Адрес пустой, используем дефолтный: {old_broker}:{old_port} -> {self.broker}:{self.port}")
+                    info("MQTT", f"Address empty, using default: {old_broker}:{old_port} -> {self.broker}:{self.port}")
             else:
                 # Адрес не установлен - используем дефолтный
                 self.broker = DEFAULT_MQTT_ADDRESS
                 self.port = 8883 if mqtt_config.tls_enabled else 1883
-                info("MQTT", f"Адрес не установлен, используем дефолтный: {old_broker}:{old_port} -> {self.broker}:{self.port}")
+                info("MQTT", f"Address not set, using default: {old_broker}:{old_port} -> {self.broker}:{self.port}")
             
             # Обновляем логин (как в firmware PubSubConfig)
             if hasattr(mqtt_config, 'username') and mqtt_config.username:
                 new_username = mqtt_config.username.strip()
                 if new_username:
                     self.username = new_username
-                    info("MQTT", f"Обновлен логин MQTT: {old_username} -> {self.username}")
+                    info("MQTT", f"Updated MQTT username: {old_username} -> {self.username}")
                 else:
                     # Логин пустой - используем дефолтный (как в firmware)
                     self.username = DEFAULT_MQTT_USERNAME
-                    info("MQTT", f"Логин пустой, используем дефолтный: {old_username} -> {self.username}")
+                    info("MQTT", f"Username empty, using default: {old_username} -> {self.username}")
             else:
                 # Логин не установлен - используем дефолтный
                 self.username = DEFAULT_MQTT_USERNAME
-                debug("MQTT", f"Логин не установлен, используем дефолтный: {old_username} -> {self.username}")
+                debug("MQTT", f"Username not set, using default: {old_username} -> {self.username}")
             
             # Обновляем пароль (как в firmware PubSubConfig)
             if hasattr(mqtt_config, 'password') and mqtt_config.password:
                 new_password = mqtt_config.password.strip()
                 if new_password:
                     self.password = new_password
-                    info("MQTT", "Обновлен пароль MQTT")
+                    info("MQTT", "Updated MQTT password")
                 else:
                     # Пароль пустой - используем дефолтный (как в firmware)
                     self.password = DEFAULT_MQTT_PASSWORD
-                    info("MQTT", "Пароль пустой, используем дефолтный")
+                    info("MQTT", "Password empty, using default")
             else:
                 # Пароль не установлен - используем дефолтный
                 self.password = DEFAULT_MQTT_PASSWORD
-                debug("MQTT", "Пароль не установлен, используем дефолтный")
+                debug("MQTT", "Password not set, using default")
             
             # Обновляем корневой топик (как в firmware)
             if hasattr(mqtt_config, 'root') and mqtt_config.root:
                 new_root = mqtt_config.root.strip()
                 if new_root:
                     self.root_topic = new_root
-                    info("MQTT", f"Обновлен корневой топик: {old_root} -> {self.root_topic}")
+                    info("MQTT", f"Updated root topic: {old_root} -> {self.root_topic}")
                 else:
                     # Корневой топик пустой - используем дефолтный (как в firmware)
                     self.root_topic = DEFAULT_MQTT_ROOT
-                    info("MQTT", f"Корневой топик пустой, используем дефолтный: {old_root} -> {self.root_topic}")
+                    info("MQTT", f"Root topic empty, using default: {old_root} -> {self.root_topic}")
             else:
                 # Корневой топик не установлен - используем дефолтный
                 self.root_topic = DEFAULT_MQTT_ROOT
-                debug("MQTT", f"Корневой топик не установлен, используем дефолтный: {old_root} -> {self.root_topic}")
+                debug("MQTT", f"Root topic not set, using default: {old_root} -> {self.root_topic}")
             
             # Проверяем, изменились ли настройки
             settings_changed = (old_broker != self.broker or old_port != self.port or 
                               old_username != self.username or old_password != self.password or 
                               old_root != self.root_topic)
             
-            info("MQTT", f"Проверка изменений настроек: changed={settings_changed}, old={old_broker}:{old_port}, new={self.broker}:{self.port}")
+            info("MQTT", f"Checking settings changes: changed={settings_changed}, old={old_broker}:{old_port}, new={self.broker}:{self.port}")
             
             # Обновляем модули с новыми настройками
             if settings_changed:
                 if self.connection and self.connection.is_connected():
-                    info("MQTT", "Переподключение с новыми настройками...")
+                    info("MQTT", "Reconnecting with new settings...")
                     self.stop()
                     time.sleep(1)
                 # Если не подключен, просто запускаем с новыми настройками
@@ -154,7 +154,7 @@ class MQTTClient:
             
             return True
         except Exception as e:
-            error("MQTT", f"Ошибка обновления настроек MQTT: {e}")
+            error("MQTT", f"Error updating MQTT settings: {e}")
             import traceback
             traceback.print_exc()
             return False
@@ -205,25 +205,25 @@ class MQTTClient:
             if hop_start != 0 and hop_limit <= hop_start:
                 hops_away = hop_start - hop_limit
                 if hops_away > 0:
-                    debug("MQTT", f"Отправка пакета: hops_away={hops_away}, hop_start={hop_start}, hop_limit={hop_limit}")
+                    debug("MQTT", f"Sending packet: hops_away={hops_away}, hop_start={hop_start}, hop_limit={hop_limit}")
             # Не отправляем пакеты, которые уже пришли из MQTT (как в firmware)
             if hasattr(packet, 'via_mqtt') and packet.via_mqtt:
-                debug("MQTT", "Пропуск публикации: пакет уже из MQTT")
+                debug("MQTT", "Skipping publication: packet already from MQTT")
                 return False
             
             # Не отправляем Admin пакеты в MQTT (как в firmware MQTT::onReceive - игнорируются Admin пакеты)
             if packet.WhichOneof('payload_variant') == 'decoded':
                 if hasattr(packet.decoded, 'portnum') and packet.decoded.portnum == portnums_pb2.PortNum.ADMIN_APP:
-                    debug("MQTT", "Пропуск публикации: Admin пакеты не отправляются в MQTT")
+                    debug("MQTT", "Skipping publication: Admin packets are not sent to MQTT")
                     return False
             
             ch = self.channels.get_by_index(channel_index)
             if not ch.settings.uplink_enabled:
-                debug("MQTT", f"Пропуск публикации: канал {channel_index} не имеет uplink_enabled")
+                debug("MQTT", f"Skipping publication: channel {channel_index} does not have uplink_enabled")
                 return False
             
             if not self.channels.any_mqtt_enabled():
-                debug("MQTT", "Пропуск публикации: нет каналов с uplink_enabled")
+                debug("MQTT", "Skipping publication: no channels with uplink_enabled")
                 return False
             
             channel_id = self.channels.get_global_id(channel_index)
@@ -241,18 +241,18 @@ class MQTTClient:
             if self.connected and self.client:
                 # Для Custom канала добавляем детальное логирование
                 if channel_id == "Custom":
-                    info("MQTT", f"📤 CUSTOM ПАКЕТ ОТПРАВЛЯЕТСЯ: topic={topic}, gateway_id={self.node_id}, channel_id={channel_id}, payload_size={len(payload)}")
+                    info("MQTT", f"📤 CUSTOM PACKET SENDING: topic={topic}, gateway_id={self.node_id}, channel_id={channel_id}, payload_size={len(payload)}")
                 self.client.publish(topic, payload)
                 if channel_id == "Custom":
-                    info("MQTT", f"✅ CUSTOM ПАКЕТ ОТПРАВЛЕН: topic={topic}")
+                    info("MQTT", f"✅ CUSTOM PACKET SENT: topic={topic}")
                 else:
-                    info("MQTT", f"Отправлен пакет: {topic} (канал {channel_index}: {channel_id})")
+                    info("MQTT", f"Packet sent: {topic} (channel {channel_index}: {channel_id})")
                 return True
             else:
-                warn("MQTT", "MQTT не подключен, пакет не отправлен")
+                warn("MQTT", "MQTT not connected, packet not sent")
                 return False
         except Exception as e:
-            error("MQTT", f"Ошибка публикации пакета: {e}")
+            error("MQTT", f"Error publishing packet: {e}")
             import traceback
             traceback.print_exc()
             return False
@@ -269,7 +269,7 @@ class MQTTClient:
             try:
                 self.connection.disconnect()
             except Exception as e:
-                warn("MQTT", f"Ошибка остановки MQTT соединения: {e}")
+                warn("MQTT", f"Error stopping MQTT connection: {e}")
             finally:
                 self.connection = None
 

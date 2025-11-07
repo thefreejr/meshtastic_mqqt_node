@@ -93,7 +93,7 @@ class Logger:
             except Exception as e:
                 # Если ошибка записи в файл, выводим предупреждение один раз
                 if not hasattr(self, '_file_error_logged'):
-                    print(f"⚠️  Ошибка записи в файл логов: {e}", file=sys.stderr)
+                    print(f"⚠️  Error writing to log file: {e}", file=sys.stderr)
                     self._file_error_logged = True
     
     def debug(self, prefix: str, message: str):

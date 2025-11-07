@@ -44,7 +44,7 @@ class MQTTSubscription:
         """
         has_downlink = False
         
-        info("MQTT", f"🔍 Начало подписки на каналы: проверяем {MAX_NUM_CHANNELS} каналов")
+        info("MQTT", f"🔍 Starting channel subscriptions: checking {MAX_NUM_CHANNELS} channels")
         
         for i in range(MAX_NUM_CHANNELS):
             ch = self.channels.get_by_index(i)
@@ -53,7 +53,7 @@ class MQTTSubscription:
             
             # Логируем статус каждого канала
             if channel_id == "Custom":
-                info("MQTT", f"🔍 Канал {i} (Custom): downlink_enabled={downlink_enabled}")
+                info("MQTT", f"🔍 Channel {i} (Custom): downlink_enabled={downlink_enabled}")
             
             if downlink_enabled:
                 has_downlink = True
@@ -61,23 +61,23 @@ class MQTTSubscription:
                 result, mid = client.subscribe(topic, qos=1)
                 if result == 0:
                     if channel_id == "Custom":
-                        info("MQTT", f"✅ ПОДПИСКА НА CUSTOM: topic={topic} (канал {i}: {channel_id})")
+                        info("MQTT", f"✅ SUBSCRIBED TO CUSTOM: topic={topic} (channel {i}: {channel_id})")
                     else:
-                        info("MQTT", f"Подписан на топик: {topic} (канал {i}: {channel_id})")
+                        info("MQTT", f"Subscribed to topic: {topic} (channel {i}: {channel_id})")
                 else:
                     if channel_id == "Custom":
-                        error("MQTT", f"❌ ОШИБКА ПОДПИСКИ НА CUSTOM: topic={topic} (код: {result})")
+                        error("MQTT", f"CUSTOM SUBSCRIPTION ERROR: topic={topic} (code: {result})")
                     else:
-                        error("MQTT", f"Ошибка подписки на топик: {topic} (код: {result})")
+                        error("MQTT", f"Error subscribing to topic: {topic} (code: {result})")
         
         # Подписываемся на PKI канал если есть хотя бы один канал с downlink
         if has_downlink:
             topic = f"{self.crypt_topic}PKI/+"
             result, mid = client.subscribe(topic, qos=1)
             if result == 0:
-                info("MQTT", f"Подписан на топик: {topic}")
+                info("MQTT", f"Subscribed to topic: {topic}")
             else:
-                error("MQTT", f"Ошибка подписки на топик: {topic} (код: {result})")
+                error("MQTT", f"Error subscribing to topic: {topic} (code: {result})")
         
         return has_downlink
     

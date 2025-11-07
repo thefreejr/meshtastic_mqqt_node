@@ -52,7 +52,7 @@ class Persistence:
                 self.settings_path = NODE_DEFAULTS_FILE
         
         self.node_id = node_id
-        debug("PERSISTENCE", f"Файл настроек: {self.settings_path} (node_id={node_id})")
+        debug("PERSISTENCE", f"Settings file: {self.settings_path} (node_id={node_id})")
     
     def _protobuf_to_dict(self, pb_msg: Any) -> Dict[str, Any]:
         """Преобразует protobuf сообщение в словарь (сериализует в base64)"""
@@ -63,7 +63,7 @@ class Persistence:
                 "_data": base64.b64encode(serialized).decode('utf-8')
             }
         except Exception as e:
-            error("PERSISTENCE", f"Ошибка сериализации protobuf: {e}")
+            error("PERSISTENCE", f"Error serializing protobuf: {e}")
             return {}
     
     def _dict_to_protobuf(self, data: Dict[str, Any], pb_class: Any) -> Any:
@@ -76,7 +76,7 @@ class Persistence:
             pb_msg.ParseFromString(serialized)
             return pb_msg
         except Exception as e:
-            error("PERSISTENCE", f"Ошибка десериализации protobuf: {e}")
+            error("PERSISTENCE", f"Error deserializing protobuf: {e}")
             return None
     
     def _channel_to_dict(self, channel: channel_pb2.Channel) -> Dict[str, Any]:
@@ -104,7 +104,7 @@ class Persistence:
                 "downlink_enabled": channel.settings.downlink_enabled,
             }
         except Exception as e:
-            error("PERSISTENCE", f"Ошибка преобразования канала в словарь: {e}")
+            error("PERSISTENCE", f"Error converting channel to dict: {e}")
             return {
                 "index": channel.index if hasattr(channel, 'index') else 0,
                 "role": channel.role if hasattr(channel, 'role') else channel_pb2.Channel.Role.DISABLED,
@@ -129,13 +129,13 @@ class Persistence:
             try:
                 channel.settings.psk = base64.b64decode(psk_b64)
             except Exception as e:
-                warn("PERSISTENCE", f"Ошибка декодирования PSK для канала {channel.index}: {e}")
+                warn("PERSISTENCE", f"Error decoding PSK for channel {channel.index}: {e}")
                 channel.settings.psk = b""
         if data.get("radio") is not None:
             try:
                 channel.settings.radio = data["radio"]
             except Exception as e:
-                debug("PERSISTENCE", f"Не удалось установить radio для канала {channel.index}: {e}")
+                debug("PERSISTENCE", f"Failed to set radio for channel {channel.index}: {e}")
         # Значения по умолчанию для uplink/downlink зависят от role
         # Если role не DISABLED, по умолчанию включены, иначе выключены
         default_enabled = channel.role != channel_pb2.Channel.Role.DISABLED
@@ -152,7 +152,7 @@ class Persistence:
             settings["channels"] = [self._channel_to_dict(ch) for ch in channels]
             return self._save_settings(settings)
         except Exception as e:
-            error("PERSISTENCE", f"Ошибка сохранения каналов: {e}")
+            error("PERSISTENCE", f"Error saving channels: {e}")
             return False
     
     def load_channels(self) -> Optional[list[channel_pb2.Channel]]:
@@ -163,7 +163,7 @@ class Persistence:
                 return None
             return [self._dict_to_channel(ch_data) for ch_data in settings["channels"]]
         except Exception as e:
-            error("PERSISTENCE", f"Ошибка загрузки каналов: {e}")
+            error("PERSISTENCE", f"Error loading channels: {e}")
             return None
     
     def save_config(self, config: config_pb2.Config) -> bool:
@@ -173,7 +173,7 @@ class Persistence:
             settings["config"] = self._protobuf_to_dict(config)
             return self._save_settings(settings)
         except Exception as e:
-            error("PERSISTENCE", f"Ошибка сохранения Config: {e}")
+            error("PERSISTENCE", f"Error saving Config: {e}")
             return False
     
     def load_config(self) -> Optional[config_pb2.Config]:
@@ -184,7 +184,7 @@ class Persistence:
                 return None
             return self._dict_to_protobuf(settings["config"], config_pb2.Config)
         except Exception as e:
-            error("PERSISTENCE", f"Ошибка загрузки Config: {e}")
+            error("PERSISTENCE", f"Error loading Config: {e}")
             return None
     
     def save_module_config(self, module_config: module_config_pb2.ModuleConfig) -> bool:
@@ -194,7 +194,7 @@ class Persistence:
             settings["module_config"] = self._protobuf_to_dict(module_config)
             return self._save_settings(settings)
         except Exception as e:
-            error("PERSISTENCE", f"Ошибка сохранения ModuleConfig: {e}")
+            error("PERSISTENCE", f"Error saving ModuleConfig: {e}")
             return False
     
     def load_module_config(self) -> Optional[module_config_pb2.ModuleConfig]:
@@ -205,7 +205,7 @@ class Persistence:
                 return None
             return self._dict_to_protobuf(settings["module_config"], module_config_pb2.ModuleConfig)
         except Exception as e:
-            error("PERSISTENCE", f"Ошибка загрузки ModuleConfig: {e}")
+            error("PERSISTENCE", f"Error loading ModuleConfig: {e}")
             return None
     
     def save_owner(self, owner: mesh_pb2.User) -> bool:
@@ -215,7 +215,7 @@ class Persistence:
             settings["owner"] = self._protobuf_to_dict(owner)
             return self._save_settings(settings)
         except Exception as e:
-            error("PERSISTENCE", f"Ошибка сохранения Owner: {e}")
+            error("PERSISTENCE", f"Error saving Owner: {e}")
             return False
     
     def load_owner(self) -> Optional[mesh_pb2.User]:
@@ -226,7 +226,7 @@ class Persistence:
                 return None
             return self._dict_to_protobuf(settings["owner"], mesh_pb2.User)
         except Exception as e:
-            error("PERSISTENCE", f"Ошибка загрузки Owner: {e}")
+            error("PERSISTENCE", f"Error loading Owner: {e}")
             return None
     
     def _load_settings(self) -> Dict[str, Any]:
@@ -238,7 +238,7 @@ class Persistence:
             with open(self.settings_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
-            warn("PERSISTENCE", f"Ошибка чтения файла настроек: {e}")
+            warn("PERSISTENCE", f"Error reading settings file: {e}")
             return {}
     
     def save_canned_messages(self, messages: str) -> bool:
@@ -248,7 +248,7 @@ class Persistence:
             settings["canned_messages"] = messages
             return self._save_settings(settings)
         except Exception as e:
-            error("PERSISTENCE", f"Ошибка сохранения шаблонных сообщений: {e}")
+            error("PERSISTENCE", f"Error saving canned messages: {e}")
             return False
     
     def load_canned_messages(self) -> Optional[str]:
@@ -259,7 +259,7 @@ class Persistence:
                 return None
             return settings["canned_messages"]
         except Exception as e:
-            error("PERSISTENCE", f"Ошибка загрузки шаблонных сообщений: {e}")
+            error("PERSISTENCE", f"Error loading canned messages: {e}")
             return None
     
     def _save_settings(self, settings: Dict[str, Any]) -> bool:
@@ -269,9 +269,9 @@ class Persistence:
             with open(self.settings_path, 'w', encoding='utf-8') as f:
                 json.dump(settings, f, indent=2, ensure_ascii=False)
             
-            info("PERSISTENCE", f"Настройки сохранены в {self.settings_path}")
+            info("PERSISTENCE", f"Settings saved to {self.settings_path}")
             return True
         except Exception as e:
-            error("PERSISTENCE", f"Ошибка записи файла настроек: {e}")
+            error("PERSISTENCE", f"Error writing settings file: {e}")
             return False
 

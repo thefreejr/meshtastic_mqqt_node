@@ -221,7 +221,7 @@ class Channels:
         # Пересчитываем hash при изменении канала
         if channel.index in self.hashes:
             del self.hashes[channel.index]
-        print(f"📝 Канал {channel.index} обновлен: role={channel.role}, name={channel.settings.name}, hash={self.get_hash(channel.index)}")
+        print(f"📝 Channel {channel.index} updated: role={channel.role}, name={channel.settings.name}, hash={self.get_hash(channel.index)}")
     
     def any_mqtt_enabled(self) -> bool:
         """Проверяет есть ли каналы с uplink или downlink (как Channels::anyMqttEnabled)"""

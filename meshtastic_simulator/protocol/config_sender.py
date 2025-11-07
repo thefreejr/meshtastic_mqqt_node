@@ -75,7 +75,7 @@ class ConfigSender:
             config_nonce: Nonce для config_complete_id
         """
         # Логирование без префикса, так как префикс добавляется в session.py
-        info("CONFIG", f"Отправка конфигурации (nonce: {config_nonce})")
+        info("CONFIG", f"Sending configuration (nonce: {config_nonce})")
         
         # 1. MyInfo
         self._send_my_info()
@@ -115,7 +115,7 @@ class ConfigSender:
                 device_id_bytes[4:8] = (self.node_num >> 32).to_bytes(4, 'little') if self.node_num > 0xFFFFFFFF else b'\x00\x00\x00\x00'
             
             self._device_id = bytes(device_id_bytes)
-            debug("CONFIG", f"Device ID установлен: {self._device_id.hex()}")
+            debug("CONFIG", f"Device ID set: {self._device_id.hex()}")
         
         my_info.device_id = self._device_id
         
@@ -146,11 +146,11 @@ class ConfigSender:
                 else:
                     node_info.user.hw_model = mesh_pb2.HardwareModel.PORTDUINO
         except Exception as e:
-            debug("CONFIG", f"Не удалось установить hw_model: {e}")
+            debug("CONFIG", f"Failed to set hw_model: {e}")
         
         if self.pki_public_key and len(self.pki_public_key) == 32:
             node_info.user.public_key = self.pki_public_key
-            info("PKI", f"Публичный ключ добавлен в NodeInfo ({self.pki_public_key[:8].hex()}...)")
+            info("PKI", f"Public key added to NodeInfo ({self.pki_public_key[:8].hex()}...)")
         
         if telemetry_pb2:
             try:
@@ -226,7 +226,7 @@ class ConfigSender:
         """Отправляет информацию о других узлах"""
         all_nodes = self.node_db.get_all_nodes()
         if all_nodes:
-            info("CONFIG", f"Отправка информации о {len(all_nodes)} узлах")
+            info("CONFIG", f"Sending information about {len(all_nodes)} nodes")
             for node_info in all_nodes:
                 from_radio = mesh_pb2.FromRadio()
                 from_radio.node_info.CopyFrom(node_info)

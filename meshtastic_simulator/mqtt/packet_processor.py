@@ -65,21 +65,25 @@ class MQTTPacketProcessor:
             payload_size = len(msg.payload) if hasattr(msg, 'payload') else 0
             
             if "Custom" in topic_str:
-                info("MQTT", f"🔍 CUSTOM TOPIC ПОЛУЧЕН: topic={topic_str}, payload_size={payload_size}")
+                info("MQTT", f"🔍 CUSTOM TOPIC RECEIVED: topic={topic_str}, payload_size={payload_size}")
             else:
-                debug("MQTT", f"Получено MQTT сообщение: topic={topic_str}, payload_size={payload_size}")
+                debug("MQTT", f"Received MQTT message: topic={topic_str}, payload_size={payload_size}")
             
             # Парсим ServiceEnvelope
             envelope = mqtt_pb2.ServiceEnvelope()
-            envelope.ParseFromString(msg.payload)
+            try:
+                envelope.ParseFromString(msg.payload)
+            except Exception as e:
+                error("MQTT", f"Error parsing ServiceEnvelope: {e} (topic: {topic_str}, payload_size: {payload_size})")
+                return False
             
             debug("MQTT", f"ServiceEnvelope: channel_id={envelope.channel_id}, gateway_id={envelope.gateway_id}, has_packet={envelope.HasField('packet')}")
             
             if envelope.channel_id == "Custom":
-                info("MQTT", f"🔍 CUSTOM КАНАЛ ОБНАРУЖЕН: topic={topic_str}, channel_id={envelope.channel_id}, gateway_id={envelope.gateway_id}")
+                info("MQTT", f"🔍 CUSTOM CHANNEL DETECTED: topic={topic_str}, channel_id={envelope.channel_id}, gateway_id={envelope.gateway_id}")
             
             if not envelope.packet or not envelope.channel_id:
-                warn("MQTT", "Неверный ServiceEnvelope: отсутствует packet или channel_id")
+                warn("MQTT", "Invalid ServiceEnvelope: missing packet or channel_id")
                 return False
             
             # Проверяем разрешения канала
@@ -90,12 +94,12 @@ class MQTTPacketProcessor:
             # Проверяем, не является ли это наш собственный пакет
             if self._is_own_packet(envelope.gateway_id):
                 if envelope.channel_id == "Custom":
-                    info("MQTT", f"🔍 Custom канал: игнорируем свой собственный пакет (gateway_id={envelope.gateway_id}, наш node_id={self.node_id})")
+                    info("MQTT", f"🔍 Custom channel: ignoring own packet (gateway_id={envelope.gateway_id}, our node_id={self.node_id})")
                 else:
-                    debug("MQTT", f"Игнорируем свой собственный пакет (gateway_id={envelope.gateway_id}, наш node_id={self.node_id})")
+                    debug("MQTT", f"Ignoring own packet (gateway_id={envelope.gateway_id}, our node_id={self.node_id})")
                 return False
             
-            info("MQTT", f"Получен пакет от {envelope.gateway_id} на канале {envelope.channel_id}")
+            info("MQTT", f"Received packet from {envelope.gateway_id} on channel {envelope.channel_id}")
             
             # Копируем пакет
             packet = mesh_pb2.MeshPacket()
@@ -115,7 +119,7 @@ class MQTTPacketProcessor:
             if packet.hop_start != 0 and packet.hop_limit <= packet.hop_start:
                 hops_away = packet.hop_start - packet.hop_limit
                 if hops_away > 0:
-                    debug("MQTT", f"Трассировка маршрута: hops_away={hops_away}, hop_start={packet.hop_start}, hop_limit={packet.hop_limit}")
+                    debug("MQTT", f"Route trace: hops_away={hops_away}, hop_start={packet.hop_start}, hop_limit={packet.hop_limit}")
             
             # Расшифровываем пакет если нужно
             payload_type = packet.WhichOneof('payload_variant')
@@ -149,7 +153,7 @@ class MQTTPacketProcessor:
                 pass  # Channel для encrypted остается как hash
             
             if envelope.channel_id == "Custom":
-                debug("MQTT", f"🔍 Custom канал обработка: payload_type={payload_type}, original_channel={original_channel}, ch.index={ch.index if ch else 'N/A'}")
+                debug("MQTT", f"🔍 Custom channel processing: payload_type={payload_type}, original_channel={original_channel}, ch.index={ch.index if ch else 'N/A'}")
             
             # Обновляем NodeDB
             if self.node_db:
@@ -165,7 +169,7 @@ class MQTTPacketProcessor:
             
             return True
         except Exception as e:
-            error("MQTT", f"Ошибка обработки сообщения: {e}")
+            error("MQTT", f"Error processing message: {e}")
             import traceback
             traceback.print_exc()
             return False
@@ -182,7 +186,7 @@ class MQTTPacketProcessor:
         """
         # Обработка PKI канала
         if channel_id == "PKI":
-            debug("MQTT", f"PKI канал разрешен")
+            debug("MQTT", f"PKI channel allowed")
             return True, None
         
         # Ищем канал по имени
@@ -190,29 +194,29 @@ class MQTTPacketProcessor:
             ch = self.channels.get_by_name(channel_id)
             channel_global_id = self.channels.get_global_id(ch.index)
             
-            debug("MQTT", f"Найден канал: channel_id={channel_id}, global_id={channel_global_id}, index={ch.index}, downlink_enabled={ch.settings.downlink_enabled}")
+            debug("MQTT", f"Found channel: channel_id={channel_id}, global_id={channel_global_id}, index={ch.index}, downlink_enabled={ch.settings.downlink_enabled}")
             
             if channel_id == "Custom":
-                debug("MQTT", f"🔍 Custom канал проверка: channel_id={channel_id}, global_id={channel_global_id}, match={channel_id.lower() == channel_global_id.lower()}, downlink_enabled={ch.settings.downlink_enabled}")
+                debug("MQTT", f"🔍 Custom channel check: channel_id={channel_id}, global_id={channel_global_id}, match={channel_id.lower() == channel_global_id.lower()}, downlink_enabled={ch.settings.downlink_enabled}")
             
             # Проверяем, что это тот же канал и downlink включен
             if channel_id.lower() == channel_global_id.lower() and ch.settings.downlink_enabled:
                 if channel_id == "Custom":
-                    debug("MQTT", f"✅ Custom канал разрешен для приема")
+                    debug("MQTT", f"✅ Custom channel allowed for receive")
                 else:
-                    debug("MQTT", f"Канал '{channel_id}' разрешен для приема")
+                    debug("MQTT", f"Channel '{channel_id}' allowed for receive")
                 return True, ch
             else:
                 if channel_id == "Custom":
-                    warn("MQTT", f"❌ Custom канал НЕ разрешен: downlink_enabled={ch.settings.downlink_enabled if ch else 'N/A'}, match={channel_id.lower() == channel_global_id.lower()}")
+                    warn("MQTT", f"Custom channel NOT allowed: downlink_enabled={ch.settings.downlink_enabled if ch else 'N/A'}, match={channel_id.lower() == channel_global_id.lower()}")
                 else:
-                    debug("MQTT", f"Пропуск пакета: канал '{channel_id}' не разрешен (downlink_enabled={ch.settings.downlink_enabled if ch else 'N/A'}, match={channel_id.lower() == channel_global_id.lower()})")
+                    debug("MQTT", f"Skipping packet: channel '{channel_id}' not allowed (downlink_enabled={ch.settings.downlink_enabled if ch else 'N/A'}, match={channel_id.lower() == channel_global_id.lower()})")
                 return False, None
         except Exception as e:
             if channel_id == "Custom":
-                error("MQTT", f"❌ Custom канал ошибка поиска: {e}")
+                error("MQTT", f"Custom channel search error: {e}")
             else:
-                warn("MQTT", f"Ошибка поиска канала '{channel_id}': {e}")
+                warn("MQTT", f"Error searching for channel '{channel_id}': {e}")
             import traceback
             traceback.print_exc()
             return False, None
@@ -250,8 +254,8 @@ class MQTTPacketProcessor:
             if (from_node and to_node and 
                 hasattr(from_node.user, 'public_key') and len(from_node.user.public_key) == 32 and
                 hasattr(to_node.user, 'public_key') and len(to_node.user.public_key) == 32):
-                debug("PKI", f"Попытка PKI расшифровки (от !{packet_from:08X} к !{packet_to:08X})")
-                warn("PKI", "PKI расшифровка пока не реализована (требуется Curve25519)")
+                debug("PKI", f"Attempting PKI decryption (from !{packet_from:08X} to !{packet_to:08X})")
+                warn("PKI", "PKI decryption not yet implemented (requires Curve25519)")
         
         # Попытка расшифровки через каналы
         channel_hash = packet.channel
@@ -281,7 +285,7 @@ class MQTTPacketProcessor:
                             packet.decoded.CopyFrom(data)
                             packet.channel = ch_idx
                             packet.ClearField('encrypted')
-                            info("MQTT", f"Пакет расшифрован с канала {ch_idx} (hash={channel_hash})")
+                            info("MQTT", f"Packet decrypted from channel {ch_idx} (hash={channel_hash})")
                             return True
                     except Exception as e:
                         continue
@@ -289,9 +293,9 @@ class MQTTPacketProcessor:
                     continue
         
         if channel_id == "Custom":
-            warn("MQTT", f"❌ Custom канал: не удалось расшифровать пакет (hash={channel_hash})")
+            warn("MQTT", f"Custom channel: failed to decrypt packet (hash={channel_hash})")
         else:
-            warn("MQTT", f"Не удалось расшифровать пакет (hash={channel_hash})")
+            warn("MQTT", f"Failed to decrypt packet (hash={channel_hash})")
         return False
     
     def _is_own_packet(self, gateway_id: Any) -> bool:
@@ -321,7 +325,7 @@ class MQTTPacketProcessor:
                             user.ParseFromString(packet.decoded.payload)
                             self.node_db.update_user(packet_from, user, ch.index if ch else 0)
                         except Exception as e:
-                            error("NODE", f"Ошибка обновления NodeInfo: {e}")
+                            error("NODE", f"Error updating NodeInfo: {e}")
                     
                     elif packet.decoded.portnum == portnums_pb2.PortNum.TELEMETRY_APP:
                         try:
@@ -332,7 +336,7 @@ class MQTTPacketProcessor:
                                 if variant == 'device_metrics':
                                     self.node_db.update_telemetry(packet_from, telemetry.device_metrics)
                         except Exception as e:
-                            error("NODE", f"Ошибка обновления telemetry: {e}")
+                            error("NODE", f"Error updating telemetry: {e}")
                     
                     elif packet.decoded.portnum == portnums_pb2.PortNum.POSITION_APP:
                         try:
@@ -340,7 +344,7 @@ class MQTTPacketProcessor:
                             position.ParseFromString(packet.decoded.payload)
                             self.node_db.update_position(packet_from, position)
                         except Exception as e:
-                            error("NODE", f"Ошибка обновления позиции: {e}")
+                            error("NODE", f"Error updating position: {e}")
         except Exception as e:
-            error("NODE", f"Ошибка обновления NodeDB: {e}")
+            error("NODE", f"Error updating NodeDB: {e}")
 

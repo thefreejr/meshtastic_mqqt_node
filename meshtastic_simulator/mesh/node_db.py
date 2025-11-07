@@ -31,7 +31,7 @@ class NodeDB:
         node_info.num = node_num & 0x7FFFFFFF
         node_info.user.id = f"!{node_num:08X}"
         self.nodes[node_num] = node_info
-        info("NODE", f"Создана новая запись: {node_info.user.id}")
+        info("NODE", f"Created new node entry: {node_info.user.id}")
         return node_info
     
     def update_from(self, packet: mesh_pb2.MeshPacket) -> None:

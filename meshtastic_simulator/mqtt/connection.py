@@ -96,7 +96,7 @@ class MQTTConnection:
                     break
             return self.connected
         except Exception as e:
-            error("MQTT", f"Ошибка подключения: {e}")
+            error("MQTT", f"Connection error: {e}")
             if self.client:
                 try:
                     self.client.loop_stop()
@@ -112,13 +112,13 @@ class MQTTConnection:
         # Проверяем успешное подключение (0 = успех)
         if result_code == 0 or (isinstance(result_code, int) and result_code == 0):
             self.connected = True
-            info("MQTT", f"Подключен к {self.broker}:{self.port}")
+            info("MQTT", f"Connected to {self.broker}:{self.port}")
             if self.on_connect_callback:
                 self.on_connect_callback(client, userdata, flags, rc, properties, reasonCode)
         else:
             # Детальное логирование ошибок
             error_msg = self._get_error_message(result_code)
-            error("MQTT", f"❌ Ошибка подключения: {error_msg} (код: {result_code})")
+            error("MQTT", f"Connection error: {error_msg} (code: {result_code})")
             self.connected = False
     
     def _on_disconnect(self, client, userdata, rc, properties=None, reasonCode=None):
@@ -128,25 +128,36 @@ class MQTTConnection:
         # В MQTT v5 может быть reasonCode вместо rc
         result_code = reasonCode if reasonCode is not None else rc
         
-        if result_code == 0 or (isinstance(result_code, int) and result_code == 0):
-            info("MQTT", "Отключен от брокера (нормальное отключение)")
+        # Обрабатываем случаи, когда код может быть None или неожиданным типом
+        if result_code is None:
+            debug("MQTT", "Disconnected from broker (reason code not provided)")
+        elif result_code == 0 or (isinstance(result_code, int) and result_code == 0):
+            info("MQTT", "Disconnected from broker (normal disconnect)")
         else:
             error_msg = self._get_error_message(result_code)
-            warn("MQTT", f"⚠️  Отключен от брокера: {error_msg} (код: {result_code})")
+            warn("MQTT", f"Disconnected from broker: {error_msg} (code: {result_code})")
         
         if self.on_disconnect_callback:
             self.on_disconnect_callback(client, userdata, rc, properties, reasonCode)
     
     def _get_error_message(self, code: Any) -> str:
         """Возвращает текстовое описание ошибки MQTT"""
+        # Обрабатываем None и пустые значения
+        if code is None:
+            return "No reason code provided"
+        
+        # Обрабатываем пустые списки/кортежи
+        if isinstance(code, (list, tuple)) and len(code) == 0:
+            return "No reason code provided"
+        
         # MQTT v3.1.1 коды ошибок
         mqtt_errors = {
-            0: "Успешно",
-            1: "Неправильная версия протокола",
-            2: "Неверный идентификатор клиента",
-            3: "Сервер недоступен",
-            4: "Неверное имя пользователя или пароль",
-            5: "Не авторизован",
+            0: "Success",
+            1: "Incorrect protocol version",
+            2: "Invalid client identifier",
+            3: "Server unavailable",
+            4: "Bad username or password",
+            5: "Not authorized",
         }
         
         # Если код - строка (как в некоторых версиях paho-mqtt)
@@ -155,7 +166,7 @@ class MQTTConnection:
         
         # Если код - число
         if isinstance(code, int):
-            return mqtt_errors.get(code, f"Неизвестная ошибка (код: {code})")
+            return mqtt_errors.get(code, f"Unknown error (code: {code})")
         
         # Если это объект с атрибутами (MQTT v5)
         if hasattr(code, 'name'):
@@ -163,7 +174,7 @@ class MQTTConnection:
         if hasattr(code, 'value'):
             return str(code.value)
         
-        return str(code)
+        return f"Unknown error type: {type(code).__name__}"
     
     def disconnect(self) -> None:
         """Отключается от MQTT брокера"""

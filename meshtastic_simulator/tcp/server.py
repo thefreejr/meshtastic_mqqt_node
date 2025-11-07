@@ -114,12 +114,12 @@ class TCPServer:
                         # или ip_to_node_id_mapping.json, то это уже обработано в миграции
                         self.device_id_to_node_id = data.get('device_id', {})
                         self.ip_to_node_id = data.get('ip', {})
-                info("TCP", f"Загружено {len(self.device_id_to_node_id)} маппингов device_id -> node_id и {len(self.ip_to_node_id)} маппингов IP -> node_id")
+                info("TCP", f"Loaded {len(self.device_id_to_node_id)} device_id -> node_id mappings and {len(self.ip_to_node_id)} IP -> node_id mappings")
             else:
                 # Миграция: загружаем из старых файлов и объединяем
                 self._migrate_old_mappings()
         except Exception as e:
-            warn("TCP", f"Ошибка загрузки маппингов: {e}")
+            warn("TCP", f"Error loading mappings: {e}")
             self.device_id_to_node_id = {}
             self.ip_to_node_id = {}
             # Пытаемся мигрировать старые файлы
@@ -134,10 +134,10 @@ class TCPServer:
             try:
                 with open(self.device_id_mapping_file, 'r', encoding='utf-8') as f:
                     self.device_id_to_node_id = json.load(f)
-                info("TCP", f"Миграция: загружено {len(self.device_id_to_node_id)} маппингов device_id из старого файла")
+                info("TCP", f"Migration: loaded {len(self.device_id_to_node_id)} device_id mappings from old file")
                 migrated = True
             except Exception as e:
-                warn("TCP", f"Ошибка миграции device_id маппинга: {e}")
+                warn("TCP", f"Error migrating device_id mapping: {e}")
                 self.device_id_to_node_id = {}
         else:
             self.device_id_to_node_id = {}
@@ -147,10 +147,10 @@ class TCPServer:
             try:
                 with open(self.ip_mapping_file, 'r', encoding='utf-8') as f:
                     self.ip_to_node_id = json.load(f)
-                info("TCP", f"Миграция: загружено {len(self.ip_to_node_id)} маппингов IP из старого файла")
+                info("TCP", f"Migration: loaded {len(self.ip_to_node_id)} IP mappings from old file")
                 migrated = True
             except Exception as e:
-                warn("TCP", f"Ошибка миграции IP маппинга: {e}")
+                warn("TCP", f"Error migrating IP mapping: {e}")
                 self.ip_to_node_id = {}
         else:
             self.ip_to_node_id = {}
@@ -162,12 +162,12 @@ class TCPServer:
             try:
                 if self.device_id_mapping_file.exists():
                     self.device_id_mapping_file.unlink()
-                    debug("TCP", "Удален старый файл device_id_mapping.json")
+                    debug("TCP", "Removed old file device_id_mapping.json")
                 if self.ip_mapping_file.exists():
                     self.ip_mapping_file.unlink()
-                    debug("TCP", "Удален старый файл ip_to_node_id_mapping.json")
+                    debug("TCP", "Removed old file ip_to_node_id_mapping.json")
             except Exception as e:
-                warn("TCP", f"Ошибка удаления старых файлов: {e}")
+                warn("TCP", f"Error removing old files: {e}")
     
     def _save_mappings(self) -> None:
         """Сохраняет все маппинги в объединенный файл"""
@@ -178,9 +178,9 @@ class TCPServer:
             }
             with open(self.mapping_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2)
-            debug("TCP", f"Сохранено {len(self.device_id_to_node_id)} маппингов device_id -> node_id и {len(self.ip_to_node_id)} маппингов IP -> node_id")
+            debug("TCP", f"Saved {len(self.device_id_to_node_id)} device_id -> node_id mappings and {len(self.ip_to_node_id)} IP -> node_id mappings")
         except Exception as e:
-            warn("TCP", f"Ошибка сохранения маппингов: {e}")
+            warn("TCP", f"Error saving mappings: {e}")
     
     def _save_device_id_mapping(self) -> None:
         """Сохраняет маппинг device_id -> node_id (обертка для совместимости)"""
@@ -198,12 +198,12 @@ class TCPServer:
         self.server_socket.listen(5)
         self.running = True
         
-        info("TCP", f"Сервер запущен на порту {self.port}")
+        info("TCP", f"Server started on port {self.port}")
         
         while self.running:
             try:
                 client_socket, client_address = self.server_socket.accept()
-                info("TCP", f"Подключение от {client_address[0]}:{client_address[1]}")
+                info("TCP", f"Connection from {client_address[0]}:{client_address[1]}")
                 
                 # Генерируем или получаем node_id для этого клиента
                 # Сначала проверяем IP -> node_id маппинг (временная идентификация)
@@ -216,7 +216,7 @@ class TCPServer:
                 node_id = None
                 if client_ip in self.ip_to_node_id:
                     node_id = self.ip_to_node_id[client_ip]
-                    info("TCP", f"Найден node_id для IP {client_ip}: {node_id}")
+                    info("TCP", f"Found node_id for IP {client_ip}: {node_id}")
                 else:
                     # Генерируем новый node_id на основе IP
                     client_hash = hashlib.md5(client_ip.encode()).hexdigest()
@@ -240,7 +240,7 @@ class TCPServer:
                     # Сохраняем маппинг IP -> node_id (сохраняется между перезапусками)
                     self.ip_to_node_id[client_ip] = node_id
                     self._save_ip_mapping()
-                    info("TCP", f"Сгенерирован node_id для клиента {client_address[0]}:{client_address[1]}: {node_id}")
+                    info("TCP", f"Generated node_id for client {client_address[0]}:{client_address[1]}: {node_id}")
                 
                 # Создаем новую сессию для этого клиента
                 session = TCPConnectionSession(
@@ -269,7 +269,7 @@ class TCPServer:
                         default_root=self.default_mqtt_root
                     )
                 else:
-                    debug("MQTT", f"MQTT отключен в module_config для сессии {session.node_id}, клиент не создается")
+                    debug("MQTT", f"MQTT disabled in module_config for session {session.node_id}, client not created")
                 
                 # Запускаем обработку клиента в отдельном потоке
                 thread = threading.Thread(
@@ -280,7 +280,7 @@ class TCPServer:
                 thread.start()
             except Exception as e:
                 if self.running:
-                    error("TCP", f"Ошибка приема подключения: {e}")
+                    error("TCP", f"Error accepting connection: {e}")
     
     def stop(self) -> None:
         """Останавливает TCP сервер"""
@@ -296,7 +296,7 @@ class TCPServer:
             try:
                 session.close()
             except Exception as e:
-                warn("TCP", f"Ошибка закрытия сессии: {e}")
+                warn("TCP", f"Error closing session: {e}")
         
         # Закрываем сокет сервера
         if self.server_socket:
@@ -309,7 +309,7 @@ class TCPServer:
         import time
         time.sleep(0.5)
         
-        info("TCP", "Сервер остановлен")
+        info("TCP", "Server stopped")
     
     def _handle_client_session(self, session: TCPConnectionSession) -> None:
         """Обрабатывает подключение TCP клиента через сессию"""
@@ -320,25 +320,29 @@ class TCPServer:
             while self.running:
                 try:
                     # Обрабатываем пакеты из MQTT для этой сессии
-                    if session.mqtt_client:
-                        while not session.mqtt_client.to_client_queue.empty():
-                            response = session.mqtt_client.to_client_queue.get_nowait()
-                            
-                            try:
-                                from_radio_data = StreamAPI.remove_framing(response)
-                                if from_radio_data:
-                                    from_radio = mesh_pb2.FromRadio()
-                                    from_radio.ParseFromString(from_radio_data)
-                                    if from_radio.HasField('packet'):
-                                        session._handle_mqtt_packet(from_radio.packet)
-                            except:
-                                pass
-                            
-                            session.client_socket.send(response)
-                except queue.Empty:
-                    pass
+                    if session.mqtt_client and hasattr(session.mqtt_client, 'to_client_queue'):
+                        try:
+                            while not session.mqtt_client.to_client_queue.empty():
+                                response = session.mqtt_client.to_client_queue.get_nowait()
+                                
+                                try:
+                                    from_radio_data = StreamAPI.remove_framing(response)
+                                    if from_radio_data:
+                                        from_radio = mesh_pb2.FromRadio()
+                                        from_radio.ParseFromString(from_radio_data)
+                                        if from_radio.HasField('packet'):
+                                            session._handle_mqtt_packet(from_radio.packet)
+                                except:
+                                    pass
+                                
+                                session.client_socket.send(response)
+                        except (AttributeError, queue.Empty):
+                            pass
+                        except Exception as e:
+                            # Ошибка при обработке MQTT пакетов не должна закрывать сессию
+                            debug("TCP", f"[{session._log_prefix()}] Error processing MQTT packets: {e}")
                 except Exception as e:
-                    error("TCP", f"[{session._log_prefix()}] Ошибка отправки пакета клиенту: {e}")
+                    error("TCP", f"[{session._log_prefix()}] Error sending packet to client: {e}")
                 
                 try:
                     data = session.client_socket.recv(4096)
@@ -368,11 +372,11 @@ class TCPServer:
                 except socket.timeout:
                     continue
                 except Exception as e:
-                    error("TCP", f"[{session._log_prefix()}] Ошибка чтения от клиента: {e}")
+                    error("TCP", f"[{session._log_prefix()}] Error reading from client: {e}")
                     break
         
         except Exception as e:
-            error("TCP", f"[{session._log_prefix()}] Ошибка обработки клиента: {e}")
+            error("TCP", f"[{session._log_prefix()}] Error processing client: {e}")
         finally:
             session.client_socket.close()
             
@@ -382,5 +386,5 @@ class TCPServer:
                     del self.active_sessions[session.client_address]
             
             session.close()
-            info("TCP", f"[{session._log_prefix()}] Клиент {session.client_address[0]}:{session.client_address[1]} отключен")
+            info("TCP", f"[{session._log_prefix()}] Client {session.client_address[0]}:{session.client_address[1]} disconnected")
 

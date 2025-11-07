@@ -9,7 +9,7 @@ try:
     from meshtastic import mesh_pb2
     from meshtastic.protobuf import portnums_pb2
 except ImportError:
-    print("Ошибка: Установите meshtastic: pip install meshtastic")
+    print("Error: Install meshtastic: pip install meshtastic")
     raise
 
 from ..config import MAX_NUM_CHANNELS, DEFAULT_HOP_LIMIT
@@ -38,13 +38,13 @@ class PacketHandler:
         if want_ack and hop_limit == 0:
             hop_limit = DEFAULT_HOP_LIMIT
             packet.hop_limit = hop_limit
-            debug("TCP", f"Установлен дефолтный hop_limit={hop_limit} для пакета с want_ack=True")
+            debug("TCP", f"Set default hop_limit={hop_limit} for packet with want_ack=True")
         
         if hop_limit > 0:
             hop_start = getattr(packet, 'hop_start', 0)
             if hop_start == 0:
                 packet.hop_start = hop_limit
-                debug("TCP", f"Установлен hop_start={hop_limit} для исходящего пакета")
+                debug("TCP", f"Set hop_start={hop_limit} for outgoing packet")
     
     @staticmethod
     def should_send_ack(packet: mesh_pb2.MeshPacket) -> bool:

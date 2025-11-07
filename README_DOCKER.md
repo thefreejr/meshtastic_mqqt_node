@@ -4,12 +4,25 @@
 
 ### Запуск с Docker Compose
 
+Docker Compose включает два сервиса:
+- **mosquitto** - MQTT брокер (порт 1883)
+- **meshtastic-node** - Meshtastic MQTT Node Simulator (порт 4403)
+
 ```bash
+# Создание password файла для Mosquitto (если еще не создан)
+# См. mosquitto/README.md для инструкций
+
 # Запуск в фоне
 docker-compose up -d
 
-# Просмотр логов
+# Просмотр логов всех сервисов
 docker-compose logs -f
+
+# Просмотр логов только meshtastic-node
+docker-compose logs -f meshtastic-node
+
+# Просмотр логов только mosquitto
+docker-compose logs -f mosquitto
 
 # Остановка
 docker-compose down
@@ -33,16 +46,46 @@ docker run -d \
 
 ## Структура volumes
 
+### Meshtastic Node
 - `./config` - конфигурационные файлы (project.yaml, node_defaults.json, nodes/)
 - `./logs` - логи приложения (simulator.log)
 - `./data` - данные узлов (опционально)
 
+### Mosquitto
+- `./mosquitto/config` - конфигурация Mosquitto (mosquitto.conf, passwd)
+- `./mosquitto/logs` - логи Mosquitto (mosquitto.log)
+- `./mosquitto/data` - данные персистентности Mosquitto
+
 ## Настройка
+
+### Meshtastic Node
 
 Все настройки находятся в `config/project.yaml`. Изменения в конфигурации требуют перезапуска контейнера:
 
 ```bash
-docker-compose restart
+docker-compose restart meshtastic-node
+```
+
+### Mosquitto
+
+Конфигурация Mosquitto находится в `mosquitto/config/mosquitto.conf`.
+
+**Важно**: Перед первым запуском создайте password файл:
+
+```bash
+# Вариант 1: Используя Docker контейнер
+docker exec -it meshtastic-mosquitto mosquitto_passwd -c /mosquitto/config/passwd username
+
+# Вариант 2: Если Mosquitto установлен локально
+mosquitto_passwd -c mosquitto/config/passwd username
+```
+
+Подробнее см. `mosquitto/README.md`.
+
+После изменения конфигурации Mosquitto:
+
+```bash
+docker-compose restart mosquitto
 ```
 
 ## Просмотр логов
@@ -54,7 +97,11 @@ docker-compose logs -f meshtastic-node
 
 ### Логи приложения (файл)
 ```bash
+# Логи Meshtastic Node
 tail -f logs/simulator.log
+
+# Логи Mosquitto
+tail -f mosquitto/logs/mosquitto.log
 ```
 
 ## Подключение клиента
@@ -71,15 +118,22 @@ meshtastic --host localhost:4403
 
 ```yaml
 environment:
-  - MQTT_BROKER=mqtt.meshtastic.org
+  # По умолчанию используется mosquitto из docker-compose
+  - MQTT_BROKER=mosquitto
   - MQTT_PORT=1883
-  - MQTT_USERNAME=meshdev
-  - MQTT_PASSWORD=large4cats
+  - MQTT_USERNAME=username  # Должен быть создан в mosquitto/config/passwd
+  - MQTT_PASSWORD=password  # Пароль, указанный при создании пользователя
 ```
+
+**Примечание**: По умолчанию `meshtastic-node` использует локальный Mosquitto из docker-compose. Для использования внешнего MQTT брокера измените `MQTT_BROKER` на нужный адрес.
 
 ## Healthcheck
 
-Контейнер включает healthcheck, который проверяет доступность TCP порта 4403. Статус можно проверить:
+Оба контейнера включают healthcheck:
+- **meshtastic-node**: проверяет доступность TCP порта 4403
+- **mosquitto**: проверяет доступность MQTT брокера
+
+Статус можно проверить:
 
 ```bash
 docker-compose ps
@@ -92,14 +146,28 @@ docker-compose ps
 Если возникают проблемы с записью в volumes, проверьте права:
 
 ```bash
-chmod -R 755 config logs data
+# Linux/Mac
+chmod -R 755 config logs data mosquitto
+
+# Windows: обычно не требуется, но убедитесь, что директории существуют
 ```
 
 ### Просмотр логов контейнера
 
 ```bash
+# Логи meshtastic-node
 docker-compose logs --tail=100 meshtastic-node
+
+# Логи mosquitto
+docker-compose logs --tail=100 mosquitto
 ```
+
+### Проблемы с Mosquitto
+
+Если Mosquitto не запускается, проверьте:
+1. Существует ли файл `mosquitto/config/passwd` (если `allow_anonymous false`)
+2. Правильность пути к конфигурации в `mosquitto/config/mosquitto.conf`
+3. Логи: `docker-compose logs mosquitto`
 
 ### Пересборка образа
 

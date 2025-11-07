@@ -99,7 +99,7 @@ def main():
     # Устанавливаем файл для логирования
     if DEFAULT_LOG_FILE:
         set_log_file(DEFAULT_LOG_FILE)
-        print(f"📝 Логи записываются в файл: {DEFAULT_LOG_FILE}")
+        print(f"📝 Logs are written to file: {DEFAULT_LOG_FILE}")
     
     # Получаем локальный IP адрес
     local_ip = get_local_ip()
@@ -125,27 +125,27 @@ def main():
     tcp_thread = threading.Thread(target=tcp_server.start, daemon=True)
     tcp_thread.start()
     
-    print("\n✓ Сервер запущен")
-    print(f"  Локальное подключение: meshtastic --host localhost:{args.tcp_port}")
+    print("\n✓ Server started")
+    print(f"  Local connection: meshtastic --host localhost:{args.tcp_port}")
     if local_ip != '127.0.0.1':
-        print(f"  Сетевое подключение: meshtastic --host {local_ip}:{args.tcp_port}")
-    print("\n👂 Ожидание подключений... (Ctrl+C для выхода)\n")
+        print(f"  Network connection: meshtastic --host {local_ip}:{args.tcp_port}")
+    print("\n👂 Waiting for connections... (Ctrl+C to exit)\n")
     
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\n\n⚠ Остановка...")
+        print("\n\n⚠ Stopping...")
         try:
             tcp_server.stop()
             # Даем время на корректное завершение всех потоков
             time.sleep(0.5)
         except Exception as e:
-            print(f"Ошибка при остановке: {e}")
+            print(f"Error during shutdown: {e}")
         finally:
             # Закрываем файл логов если был открыт
             set_log_file(None)  # Закрывает файл
-        print("✓ Остановлено")
+        print("✓ Stopped")
         return 0
 
 

@@ -50,7 +50,7 @@ class SettingsLoader:
             Количество загруженных компонентов
         """
         try:
-            info("PERSISTENCE", f"{self.log_prefix} Загрузка сохраненных настроек...")
+            info("PERSISTENCE", f"{self.log_prefix} Loading saved settings...")
             loaded_count = 0
             
             # Загружаем каналы
@@ -74,14 +74,14 @@ class SettingsLoader:
                 loaded_count += 1
             
             if loaded_count == 0:
-                debug("PERSISTENCE", f"{self.log_prefix} Используются настройки по умолчанию (файл настроек не найден или пуст)")
+                debug("PERSISTENCE", f"{self.log_prefix} Using default settings (settings file not found or empty)")
             else:
-                info("PERSISTENCE", f"{self.log_prefix} Загрузка настроек завершена: загружено {loaded_count} компонентов")
+                info("PERSISTENCE", f"{self.log_prefix} Settings loading completed: loaded {loaded_count} components")
             
             return loaded_count
             
         except Exception as e:
-            error("PERSISTENCE", f"{self.log_prefix} Ошибка загрузки настроек: {e}")
+            error("PERSISTENCE", f"{self.log_prefix} Error loading settings: {e}")
             raise PersistenceError(f"Ошибка загрузки настроек: {e}", file_path=str(self.persistence.settings_path))
     
     def _load_channels(self) -> bool:
@@ -92,28 +92,28 @@ class SettingsLoader:
                 # Проверяем корректность каналов
                 for i, ch in enumerate(saved_channels):
                     if ch.index != i:
-                        warn("PERSISTENCE", f"{self.log_prefix} Неверный индекс канала {i}: {ch.index}, пропускаем загрузку")
+                        warn("PERSISTENCE", f"{self.log_prefix} Invalid channel index {i}: {ch.index}, skipping load")
                         return False
                 
                 self.channels.channels = saved_channels
                 self.channels.hashes = {}  # Пересчитываем hashes
                 
-                info("PERSISTENCE", f"{self.log_prefix} Загружено {len(saved_channels)} каналов из файла (индивидуальные настройки)")
+                info("PERSISTENCE", f"{self.log_prefix} Loaded {len(saved_channels)} channels from file (individual settings)")
                 
                 # Логируем статус Custom канала
                 if len(saved_channels) > 1:
                     custom_ch = saved_channels[1]
-                    info("PERSISTENCE", f"{self.log_prefix} Загружено {len(saved_channels)} каналов. Custom канал (index=1): downlink_enabled={custom_ch.settings.downlink_enabled}, uplink_enabled={custom_ch.settings.uplink_enabled}")
+                    info("PERSISTENCE", f"{self.log_prefix} Loaded {len(saved_channels)} channels. Custom channel (index=1): downlink_enabled={custom_ch.settings.downlink_enabled}, uplink_enabled={custom_ch.settings.uplink_enabled}")
                 
                 return True
             else:
                 if saved_channels:
-                    warn("PERSISTENCE", f"{self.log_prefix} Неверное количество каналов: {len(saved_channels)}, ожидалось {MAX_NUM_CHANNELS}")
+                    warn("PERSISTENCE", f"{self.log_prefix} Invalid number of channels: {len(saved_channels)}, expected {MAX_NUM_CHANNELS}")
                 else:
-                    debug("PERSISTENCE", f"{self.log_prefix} Индивидуальные настройки каналов не найдены, используются дефолтные из node_defaults.json")
+                    debug("PERSISTENCE", f"{self.log_prefix} Individual channel settings not found, using defaults from node_defaults.json")
                 return False
         except Exception as e:
-            error("PERSISTENCE", f"{self.log_prefix} Ошибка загрузки каналов: {e}")
+            error("PERSISTENCE", f"{self.log_prefix} Error loading channels: {e}")
             return False
     
     def _load_config(self) -> bool:
@@ -122,13 +122,13 @@ class SettingsLoader:
             saved_config = self.persistence.load_config()
             if saved_config:
                 self.config_storage.config.CopyFrom(saved_config)
-                info("PERSISTENCE", f"{self.log_prefix} Загружен Config из файла (индивидуальные настройки)")
+                info("PERSISTENCE", f"{self.log_prefix} Loaded Config from file (individual settings)")
                 return True
             else:
-                debug("PERSISTENCE", f"{self.log_prefix} Индивидуальные настройки Config не найдены, используются дефолтные из node_defaults.json")
+                debug("PERSISTENCE", f"{self.log_prefix} Individual Config settings not found, using defaults from node_defaults.json")
                 return False
         except Exception as e:
-            error("PERSISTENCE", f"{self.log_prefix} Ошибка загрузки Config: {e}")
+            error("PERSISTENCE", f"{self.log_prefix} Error loading Config: {e}")
             return False
     
     def _load_module_config(self) -> bool:
@@ -137,13 +137,13 @@ class SettingsLoader:
             saved_module_config = self.persistence.load_module_config()
             if saved_module_config:
                 self.config_storage.set_module_config(saved_module_config)
-                info("PERSISTENCE", f"{self.log_prefix} Загружен ModuleConfig из файла (индивидуальные настройки)")
+                info("PERSISTENCE", f"{self.log_prefix} Loaded ModuleConfig from file (individual settings)")
                 return True
             else:
-                debug("PERSISTENCE", f"{self.log_prefix} Индивидуальные настройки ModuleConfig не найдены, используются дефолтные из node_defaults.json")
+                debug("PERSISTENCE", f"{self.log_prefix} Individual ModuleConfig settings not found, using defaults from node_defaults.json")
                 return False
         except Exception as e:
-            error("PERSISTENCE", f"{self.log_prefix} Ошибка загрузки ModuleConfig: {e}")
+            error("PERSISTENCE", f"{self.log_prefix} Error loading ModuleConfig: {e}")
             return False
     
     def _load_owner(self) -> bool:
@@ -158,13 +158,13 @@ class SettingsLoader:
                 if self.pki_public_key and len(self.pki_public_key) == 32:
                     self.owner.public_key = self.pki_public_key
                 
-                info("PERSISTENCE", f"{self.log_prefix} Загружен Owner из файла: {self.owner.long_name}/{self.owner.short_name}")
+                info("PERSISTENCE", f"{self.log_prefix} Loaded Owner from file: {self.owner.long_name}/{self.owner.short_name}")
                 return True
             else:
-                debug("PERSISTENCE", f"{self.log_prefix} Сохраненный Owner не найден, используются значения по умолчанию")
+                debug("PERSISTENCE", f"{self.log_prefix} Saved Owner not found, using default values")
                 return False
         except Exception as e:
-            error("PERSISTENCE", f"{self.log_prefix} Ошибка загрузки Owner: {e}")
+            error("PERSISTENCE", f"{self.log_prefix} Error loading Owner: {e}")
             return False
     
     def _load_canned_messages(self) -> bool:
@@ -175,12 +175,12 @@ class SettingsLoader:
                 # Если есть сообщения, включаем модуль (как в firmware)
                 if saved_canned_messages:
                     self.config_storage.module_config.canned_message.enabled = True
-                debug("PERSISTENCE", f"{self.log_prefix} Загружены шаблонные сообщения")
+                debug("PERSISTENCE", f"{self.log_prefix} Loaded canned messages")
                 return True
             else:
-                debug("PERSISTENCE", f"{self.log_prefix} Сохраненные шаблонные сообщения не найдены")
+                debug("PERSISTENCE", f"{self.log_prefix} Saved canned messages not found")
                 return False
         except Exception as e:
-            error("PERSISTENCE", f"{self.log_prefix} Ошибка загрузки шаблонных сообщений: {e}")
+            error("PERSISTENCE", f"{self.log_prefix} Error loading canned messages: {e}")
             return False
 

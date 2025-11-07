@@ -1,12 +1,45 @@
-version: '3.8'
+
 
 services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: meshtastic-mosquitto
+    restart: unless-stopped
+    command: mosquitto -c /mosquitto/config/mosquitto.conf
+    
+    # Порт MQTT
+    ports:
+      - "1883:1883"
+    
+    # Volumes для конфигурации, логов и данных
+    volumes:
+      - ./mosquitto/config:/mosquitto/config:ro
+      - ./mosquitto/logs:/mosquitto/logs:rw
+      - ./mosquitto/data:/mosquitto/data:rw
+    
+    # Логирование Docker
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Healthcheck
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-h", "localhost", "-t", "$$SYS/health", "-C", "1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
   meshtastic-node:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: meshtastic-mqtt-node
     restart: unless-stopped
+    depends_on:
+      - mosquitto
     
     # Порт для TCP подключения
     ports:
@@ -14,7 +47,7 @@ services:
     
     # Volumes для сохранения данных
     volumes:
-      # Конфигурация (read-only для безопасности, но можно сделать read-write для изменений)
+      # Конфигурация
       - ./config:/app/config:rw
       # Логи в отдельную папку на хосте
       - ./logs:/app/logs:rw
@@ -25,7 +58,8 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       # Можно переопределить настройки MQTT через переменные окружения
-      # - MQTT_BROKER=mqtt.meshtastic.org
+      # По умолчанию использует mosquitto из docker-compose
+      # - MQTT_BROKER=mosquitto
       # - MQTT_PORT=1883
       # - MQTT_USERNAME=meshdev
       # - MQTT_PASSWORD=large4cats
@@ -44,5 +78,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
-
-

@@ -26,7 +26,7 @@ class PKIManager:
             Tuple[private_key, public_key] или (None, None) если криптография недоступна
         """
         if not CRYPTOGRAPHY_AVAILABLE:
-            error("PKI", "Криптография недоступна, PKI ключи не будут сгенерированы")
+            error("PKI", "Cryptography unavailable, PKI keys will not be generated")
             return None, None
         
         try:
@@ -38,14 +38,14 @@ class PKIManager:
             public_bytes = public_key.public_bytes_raw()
             
             if len(public_bytes) != 32:
-                raise CryptoError(f"Неверный размер публичного ключа: {len(public_bytes)} байт (ожидается 32)")
+                raise CryptoError(f"Invalid public key size: {len(public_bytes)} bytes (expected 32)")
             
-            debug("PKI", f"PKI ключи сгенерированы (public_key: {public_bytes.hex()[:16]}...)")
+            debug("PKI", f"PKI keys generated (public_key: {public_bytes.hex()[:16]}...)")
             return private_bytes, public_bytes
             
         except Exception as e:
-            error("PKI", f"Ошибка генерации PKI ключей: {e}")
-            raise CryptoError(f"Ошибка генерации PKI ключей: {e}", operation="generate_keypair")
+            error("PKI", f"Error generating PKI keys: {e}")
+            raise CryptoError(f"Error generating PKI keys: {e}", operation="generate_keypair")
     
     @staticmethod
     def is_available() -> bool:
