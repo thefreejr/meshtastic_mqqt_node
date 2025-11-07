@@ -27,7 +27,7 @@ config/nodes/
 config/node_id_mapping.json
 data/
 
-
+examples
 
 # Docker
 .dockerignore
