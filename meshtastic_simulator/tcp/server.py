@@ -130,7 +130,7 @@ class TCPServer:
         migrated = False
         
         # Загружаем device_id маппинг из старого файла
-        if self.device_id_mapping_file.exists():
+            if self.device_id_mapping_file.exists():
             try:
                 with open(self.device_id_mapping_file, 'r', encoding='utf-8') as f:
                     self.device_id_to_node_id = json.load(f)
@@ -139,7 +139,7 @@ class TCPServer:
             except Exception as e:
                 warn("TCP", f"Error migrating device_id mapping: {e}")
                 self.device_id_to_node_id = {}
-        else:
+            else:
             self.device_id_to_node_id = {}
         
         # Загружаем IP маппинг из старого файла
@@ -322,22 +322,22 @@ class TCPServer:
                     # Обрабатываем пакеты из MQTT для этой сессии
                     if session.mqtt_client and hasattr(session.mqtt_client, 'to_client_queue'):
                         try:
-                            while not session.mqtt_client.to_client_queue.empty():
-                                response = session.mqtt_client.to_client_queue.get_nowait()
-                                
-                                try:
-                                    from_radio_data = StreamAPI.remove_framing(response)
-                                    if from_radio_data:
-                                        from_radio = mesh_pb2.FromRadio()
-                                        from_radio.ParseFromString(from_radio_data)
-                                        if from_radio.HasField('packet'):
-                                            session._handle_mqtt_packet(from_radio.packet)
-                                except:
-                                    pass
-                                
-                                session.client_socket.send(response)
+                        while not session.mqtt_client.to_client_queue.empty():
+                            response = session.mqtt_client.to_client_queue.get_nowait()
+                            
+                            try:
+                                from_radio_data = StreamAPI.remove_framing(response)
+                                if from_radio_data:
+                                    from_radio = mesh_pb2.FromRadio()
+                                    from_radio.ParseFromString(from_radio_data)
+                                    if from_radio.HasField('packet'):
+                                        session._handle_mqtt_packet(from_radio.packet)
+                            except:
+                                pass
+                            
+                            session.client_socket.send(response)
                         except (AttributeError, queue.Empty):
-                            pass
+                    pass
                         except Exception as e:
                             # Ошибка при обработке MQTT пакетов не должна закрывать сессию
                             debug("TCP", f"[{session._log_prefix()}] Error processing MQTT packets: {e}")
