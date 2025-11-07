@@ -2,10 +2,12 @@
 Утилиты для логирования
 """
 
+import os
 import sys
 from datetime import datetime
 from enum import IntEnum
-from typing import Optional, List
+from pathlib import Path
+from typing import List, Optional
 
 
 class LogLevel(IntEnum):
@@ -20,15 +22,42 @@ class LogLevel(IntEnum):
 class Logger:
     """Класс для логирования с поддержкой уровней и фильтрации категорий"""
     
-    def __init__(self, level: LogLevel = LogLevel.INFO, categories: Optional[List[str]] = None):
+    def __init__(self, level: LogLevel = LogLevel.INFO, categories: Optional[List[str]] = None, log_file: Optional[str] = None) -> None:
         self.level = level
         self.categories = categories  # None = все категории, список = только разрешённые
+        self.log_file = log_file  # Путь к файлу для логирования (None = только stdout)
+        self.log_file_handle = None
         self.symbols = {
             LogLevel.DEBUG: "🔍️",
             LogLevel.INFO: "ℹ️ ",
             LogLevel.WARN: "⚠️ ",
             LogLevel.ERROR: "❌ ",
         }
+        
+        # Открываем файл для логирования если указан
+        if self.log_file:
+            self._open_log_file()
+    
+    def _open_log_file(self) -> None:
+        """Открывает файл для логирования"""
+        try:
+            log_path = Path(self.log_file)
+            # Создаем директорию если её нет
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            # Открываем файл в режиме append
+            self.log_file_handle = open(log_path, 'a', encoding='utf-8', buffering=1)  # line buffering
+        except Exception as e:
+            print(f"⚠️  Ошибка открытия файла логов {self.log_file}: {e}", file=sys.stderr)
+            self.log_file_handle = None
+    
+    def _close_log_file(self) -> None:
+        """Закрывает файл логирования"""
+        if self.log_file_handle:
+            try:
+                self.log_file_handle.close()
+            except:
+                pass
+            self.log_file_handle = None
     
     def _should_log(self, level: LogLevel, category: str) -> bool:
         """Проверяет, нужно ли логировать сообщение данного уровня и категории"""
@@ -51,8 +80,21 @@ class Logger:
         
         timestamp = datetime.now().strftime("%H:%M:%S")
         symbol = self.symbols.get(level, "•")
+        log_message = f"[{timestamp}] [{prefix}] {symbol} {message}"
         
-        print(f"[{timestamp}] [{prefix}] {symbol} {message}", file=sys.stdout)
+        # Выводим в stdout
+        print(log_message, file=sys.stdout)
+        
+        # Записываем в файл если указан
+        if self.log_file_handle:
+            try:
+                self.log_file_handle.write(log_message + '\n')
+                self.log_file_handle.flush()
+            except Exception as e:
+                # Если ошибка записи в файл, выводим предупреждение один раз
+                if not hasattr(self, '_file_error_logged'):
+                    print(f"⚠️  Ошибка записи в файл логов: {e}", file=sys.stderr)
+                    self._file_error_logged = True
     
     def debug(self, prefix: str, message: str):
         """Логирование уровня DEBUG"""
@@ -75,10 +117,26 @@ class Logger:
 _logger = Logger()
 
 
-def set_log_level(level: LogLevel):
+def set_log_level(level: LogLevel) -> None:
     """Устанавливает уровень логирования"""
     global _logger
     _logger.level = level
+
+
+def set_log_file(log_file: Optional[str]):
+    """Устанавливает файл для логирования
+    
+    Args:
+        log_file: Путь к файлу для логирования (None = только stdout)
+    """
+    global _logger
+    # Закрываем старый файл если был открыт
+    if _logger.log_file_handle:
+        _logger._close_log_file()
+    
+    _logger.log_file = log_file
+    if log_file:
+        _logger._open_log_file()
 
 
 def get_log_level() -> LogLevel:
@@ -86,7 +144,7 @@ def get_log_level() -> LogLevel:
     return _logger.level
 
 
-def set_log_categories(categories: Optional[List[str]]):
+def set_log_categories(categories: Optional[List[str]]) -> None:
     """Устанавливает фильтр категорий логов
     
     Args:

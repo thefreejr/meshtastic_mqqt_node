@@ -2,16 +2,18 @@
 База данных узлов (из firmware/src/mesh/NodeDB.cpp)
 """
 
-from typing import Optional
+from typing import Any, Optional
+
 from meshtastic import mesh_pb2
-from ..utils.logger import log, debug, info, warn, error, LogLevel
+
+from ..utils.logger import LogLevel, debug, error, info, log, warn
 from .rtc import RTCQuality, get_valid_time
 
 
 class NodeDB:
     """База данных узлов (из firmware/src/mesh/NodeDB.cpp)"""
     
-    def __init__(self, our_node_num: int):
+    def __init__(self, our_node_num: int) -> None:
         self.our_node_num = our_node_num
         self.nodes = {}  # dict[node_num] -> NodeInfo
         self.read_index = 0
@@ -32,7 +34,7 @@ class NodeDB:
         info("NODE", f"Создана новая запись: {node_info.user.id}")
         return node_info
     
-    def update_from(self, packet: mesh_pb2.MeshPacket):
+    def update_from(self, packet: mesh_pb2.MeshPacket) -> None:
         """Обновляет информацию о узле из входящего пакета"""
         packet_from = getattr(packet, 'from', 0)
         if not packet_from or packet_from == self.our_node_num:
@@ -65,7 +67,7 @@ class NodeDB:
             if packet.hop_start != 0 and packet.hop_limit <= packet.hop_start:
                 node_info.hops_away = packet.hop_start - packet.hop_limit
     
-    def update_telemetry(self, node_num: int, device_metrics):
+    def update_telemetry(self, node_num: int, device_metrics: Any) -> None:
         """Обновляет информацию о telemetry устройства"""
         try:
             node_info = self.get_or_create_mesh_node(node_num)
@@ -118,7 +120,7 @@ class NodeDB:
         """Возвращает количество узлов в базе данных"""
         return len(self.nodes)
     
-    def get_all_nodes(self) -> list:
+    def get_all_nodes(self) -> list[mesh_pb2.NodeInfo]:
         """Возвращает список всех узлов (кроме нашего)"""
         return [node for node_num, node in self.nodes.items() if node_num != self.our_node_num]
 

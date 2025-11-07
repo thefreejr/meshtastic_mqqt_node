@@ -1,8 +1,4 @@
 {
-  "owner": {
-    "_type": "meshtastic.protobuf.User",
-    "_data": "CgkhNTUyNENEQ0ESCU1RVFQgTm9kZRoEVVJBTkIg5fFlmeOIdqkJA3jkk1k7+p8AZkOYaiYMPvuWolEC/2RIAA=="
-  },
   "channels": [
     {
       "index": 0,
@@ -15,12 +11,12 @@
     },
     {
       "index": 1,
-      "role": 2,
+      "role": 0,
       "name": "",
-      "psk": "7qVlKJVlxB9FAqw8pDSUUHLA5zgWdYJfFkj8EoTT71k=",
+      "psk": "",
       "radio": null,
-      "uplink_enabled": true,
-      "downlink_enabled": true
+      "uplink_enabled": false,
+      "downlink_enabled": false
     },
     {
       "index": 2,
@@ -76,5 +72,14 @@
       "uplink_enabled": false,
       "downlink_enabled": false
     }
-  ]
+  ],
+  "config": {
+    "_type": "meshtastic.protobuf.Config",
+    "_data": "OgA="
+  },
+  "module_config": {
+    "_type": "meshtastic.protobuf.ModuleConfig",
+    "_data": "CjMIARITbXF0dC5tZXNodGFzdGljLm9yZxoHbWVzaGRldiIKbGFyZ2U0Y2F0cygBQgNtc2g="
+  },
+  "owner": null
 }

@@ -17,9 +17,10 @@ import time
 # Импорты из новой модульной структуры
 from meshtastic_simulator.config import (
     DEFAULT_MQTT_ADDRESS, DEFAULT_MQTT_USERNAME, DEFAULT_MQTT_PASSWORD, 
-    DEFAULT_MQTT_ROOT, DEFAULT_LOG_LEVEL, DEFAULT_LOG_CATEGORIES
+    DEFAULT_MQTT_ROOT, DEFAULT_LOG_LEVEL, DEFAULT_LOG_CATEGORIES,
+    DEFAULT_LOG_FILE, TCP_HOST, TCP_PORT
 )
-from meshtastic_simulator.utils.logger import set_log_level, set_log_categories, LogLevel
+from meshtastic_simulator.utils.logger import set_log_level, set_log_categories, set_log_file, LogLevel
 from meshtastic_simulator.tcp import TCPServer
 
 
@@ -48,8 +49,8 @@ def main():
                        help=f'MQTT корневой топик (по умолчанию: {DEFAULT_MQTT_ROOT})')
     parser.add_argument('--node-id', default=None,
                        help='Node ID (deprecated: each session now generates its own node_id)')
-    parser.add_argument('--tcp-port', type=int, default=4403,
-                       help='TCP порт (по умолчанию: 4403)')
+    parser.add_argument('--tcp-port', type=int, default=TCP_PORT,
+                       help=f'TCP порт (по умолчанию: {TCP_PORT} из config/project.yaml)')
     parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARN', 'ERROR', 'NONE'],
                        default=None,
                        help='Уровень логирования (по умолчанию: из config.py)')
@@ -73,6 +74,11 @@ def main():
     else:
         # Используем настройку из config.py
         set_log_categories(DEFAULT_LOG_CATEGORIES)
+    
+    # Устанавливаем файл для логирования
+    if DEFAULT_LOG_FILE:
+        set_log_file(DEFAULT_LOG_FILE)
+        print(f"📝 Логи записываются в файл: {DEFAULT_LOG_FILE}")
     
     print("="*70)
     print("Meshtastic MQTT Node Simulator (Multi-Session)")
@@ -104,7 +110,15 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n\n⚠ Остановка...")
-        tcp_server.stop()
+        try:
+            tcp_server.stop()
+            # Даем время на корректное завершение всех потоков
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"Ошибка при остановке: {e}")
+        finally:
+            # Закрываем файл логов если был открыт
+            set_log_file(None)  # Закрывает файл
         print("✓ Остановлено")
         return 0
 

@@ -1,0 +1,48 @@
+# Настройки проекта Meshtastic MQTT Node Simulator
+
+# TCP Server настройки
+tcp:
+  host: "0.0.0.0"
+  port: 4403
+
+# MQTT настройки по умолчанию
+mqtt:
+  address: "mqtt.meshtastic.org"
+  port: 1883
+  username: "meshdev"
+  password: "large4cats"
+  root: "msh"
+
+# Логирование
+logging:
+  level: "DEBUG"  # DEBUG, INFO, WARN, ERROR, NONE
+  categories: null  # null = все категории, или список: ["TCP", "MQTT", "ADMIN"]
+  file: logs/simulator.log  # null = не записывать в файл, или путь: "logs/simulator.log" (в Docker будет в volume ./logs)
+
+# Константы
+constants:
+  streamapi:
+    start1: 0x94
+    start2: 0xC3
+    header_len: 4
+    max_to_from_radio_size: 512
+  channels:
+    max_num_channels: 8
+  hop:
+    max: 7
+    default_limit: 3
+
+# Конфигурация узла (для отправки клиенту)
+node:
+  user_long_name: "MQTT Node"
+  user_short_name: "MQTT"
+  hw_model: "PORTDUINO"
+  device_metrics:
+    battery_level: 101  # 101 = powered (pwd)
+    voltage: 5.0
+    channel_utilization: 0.0
+    air_util_tx: 0.0
+  firmware_version: "2.6.11.60ec05e"
+  fallback_node_num: 0x12345678
+
+

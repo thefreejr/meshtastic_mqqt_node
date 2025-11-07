@@ -2,45 +2,59 @@
 Модуль для сохранения и загрузки настроек узла (из firmware/src/mesh/NodeDB.cpp)
 """
 
-import json
 import base64
+import json
 import os
 from pathlib import Path
-from typing import Optional, Dict, Any
-from meshtastic import mesh_pb2
-from meshtastic.protobuf import config_pb2, module_config_pb2, channel_pb2
-from ..utils.logger import debug, info, warn, error
+from typing import Any, Dict, Optional
 
-# Имя файла для сохранения настроек
-SETTINGS_FILE = "node_settings.json"
+from meshtastic import mesh_pb2
+from meshtastic.protobuf import channel_pb2, config_pb2, module_config_pb2
+
+from ..utils.logger import debug, error, info, warn
+
+# Путь к директории конфигурации
+CONFIG_DIR = Path(__file__).parent.parent.parent / "config"
+NODES_DIR = CONFIG_DIR / "nodes"
+NODE_DEFAULTS_FILE = CONFIG_DIR / "node_defaults.json"
+
+# Создаем директорию nodes, если её нет
+NODES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class Persistence:
-    """Класс для сохранения и загрузки настроек узла"""
+    """
+    Класс для сохранения и загрузки настроек узла
+    Использует config/nodes/node_!NODEID.json для индивидуальных настроек
+    и config/node_defaults.json для дефолтных настроек
+    """
     
     def __init__(self, settings_dir: Optional[str] = None, node_id: Optional[str] = None):
         """
         Инициализирует модуль сохранения настроек
         
         Args:
-            settings_dir: Директория для сохранения настроек (по умолчанию текущая)
-            node_id: Node ID для создания уникального файла настроек (если None - используется SETTINGS_FILE)
+            settings_dir: Директория для сохранения настроек (по умолчанию config/nodes/)
+            node_id: Node ID для создания уникального файла настроек (если None - используется node_defaults.json)
         """
         if node_id:
-            # Используем node_id для создания уникального файла настроек
-            settings_filename = f"node_settings_{node_id}.json"
+            # Используем node_id для создания уникального файла настроек в config/nodes/
+            settings_filename = f"node_{node_id}.json"
+            if settings_dir:
+                self.settings_path = Path(settings_dir) / settings_filename
+            else:
+                self.settings_path = NODES_DIR / settings_filename
         else:
-            settings_filename = SETTINGS_FILE
-        
-        if settings_dir:
-            self.settings_path = Path(settings_dir) / settings_filename
-        else:
-            self.settings_path = Path(settings_filename)
+            # Если node_id не указан, используем дефолтный файл
+            if settings_dir:
+                self.settings_path = Path(settings_dir) / "node_defaults.json"
+            else:
+                self.settings_path = NODE_DEFAULTS_FILE
         
         self.node_id = node_id
         debug("PERSISTENCE", f"Файл настроек: {self.settings_path} (node_id={node_id})")
     
-    def _protobuf_to_dict(self, pb_msg) -> Dict[str, Any]:
+    def _protobuf_to_dict(self, pb_msg: Any) -> Dict[str, Any]:
         """Преобразует protobuf сообщение в словарь (сериализует в base64)"""
         try:
             serialized = pb_msg.SerializeToString()
@@ -52,7 +66,7 @@ class Persistence:
             error("PERSISTENCE", f"Ошибка сериализации protobuf: {e}")
             return {}
     
-    def _dict_to_protobuf(self, data: Dict[str, Any], pb_class):
+    def _dict_to_protobuf(self, data: Dict[str, Any], pb_class: Any) -> Any:
         """Преобразует словарь обратно в protobuf сообщение"""
         try:
             if "_type" not in data or "_data" not in data:
@@ -122,13 +136,16 @@ class Persistence:
                 channel.settings.radio = data["radio"]
             except Exception as e:
                 debug("PERSISTENCE", f"Не удалось установить radio для канала {channel.index}: {e}")
-        channel.settings.uplink_enabled = data.get("uplink_enabled", True)
-        channel.settings.downlink_enabled = data.get("downlink_enabled", True)
+        # Значения по умолчанию для uplink/downlink зависят от role
+        # Если role не DISABLED, по умолчанию включены, иначе выключены
+        default_enabled = channel.role != channel_pb2.Channel.Role.DISABLED
+        channel.settings.uplink_enabled = data.get("uplink_enabled", default_enabled)
+        channel.settings.downlink_enabled = data.get("downlink_enabled", default_enabled)
         # Убеждаемся, что has_settings установлен
         # В protobuf has_settings проверяется через HasField, но для совместимости устанавливаем
         return channel
     
-    def save_channels(self, channels: list) -> bool:
+    def save_channels(self, channels: list[channel_pb2.Channel]) -> bool:
         """Сохраняет каналы в файл"""
         try:
             settings = self._load_settings()
@@ -138,7 +155,7 @@ class Persistence:
             error("PERSISTENCE", f"Ошибка сохранения каналов: {e}")
             return False
     
-    def load_channels(self) -> Optional[list]:
+    def load_channels(self) -> Optional[list[channel_pb2.Channel]]:
         """Загружает каналы из файла"""
         try:
             settings = self._load_settings()
@@ -248,15 +265,6 @@ class Persistence:
     def _save_settings(self, settings: Dict[str, Any]) -> bool:
         """Сохраняет настройки в файл"""
         try:
-            # Создаем резервную копию если файл существует
-            if self.settings_path.exists():
-                backup_path = self.settings_path.with_suffix('.json.bak')
-                try:
-                    import shutil
-                    shutil.copy2(self.settings_path, backup_path)
-                except Exception:
-                    pass  # Игнорируем ошибки резервного копирования
-            
             # Сохраняем настройки
             with open(self.settings_path, 'w', encoding='utf-8') as f:
                 json.dump(settings, f, indent=2, ensure_ascii=False)

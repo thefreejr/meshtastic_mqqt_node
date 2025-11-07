@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  meshtastic-node:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: meshtastic-mqtt-node
+    restart: unless-stopped
+    
+    # Порт для TCP подключения
+    ports:
+      - "4403:4403"
+    
+    # Volumes для сохранения данных
+    volumes:
+      # Конфигурация (read-only для безопасности, но можно сделать read-write для изменений)
+      - ./config:/app/config:rw
+      # Логи в отдельную папку на хосте
+      - ./logs:/app/logs:rw
+      # Данные узлов (если нужно отдельно)
+      - ./data:/app/data:rw
+    
+    # Переменные окружения (опционально, можно переопределить настройки из config/project.yaml)
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Можно переопределить настройки MQTT через переменные окружения
+      # - MQTT_BROKER=mqtt.meshtastic.org
+      # - MQTT_PORT=1883
+      # - MQTT_USERNAME=meshdev
+      # - MQTT_PASSWORD=large4cats
+    
+    # Логирование Docker
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Healthcheck (опционально)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.connect(('localhost', 4403)); s.close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+

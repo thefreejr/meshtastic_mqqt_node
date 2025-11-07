@@ -1,7 +1,11 @@
 {
   "owner": {
     "_type": "meshtastic.protobuf.User",
-    "_data": "CgkhN0REODg2MjcSCU1RVFQgTm9kZRoEVVJBTkIgDJZb8bbqpFWcNfHvOD1k+j6rkpH1RO/4/ln0qaCUHBdIAA=="
+    "_data": "CgkhNTFBMjREOEUSCU1RVFQgTm9kZRoEVVJBTkIgfufC8P5qTRHiBUKVXG+ku2MsxjOb9ASE7HP2uTpQMx1IAA=="
+  },
+  "module_config": {
+    "_type": "meshtastic.protobuf.ModuleConfig",
+    "_data": "CiIIARINMTk1LjEzMy43NS4zMRoCbjEiAm4xKAFCA21zaFoA"
   },
   "channels": [
     {
@@ -17,7 +21,7 @@
       "index": 1,
       "role": 2,
       "name": "",
-      "psk": "YWoHszE5E8rbd2l7CxWxWia7qe9GYnBW5O8MIQJdmFk=",
+      "psk": "E9ChgCyqEWO08se7L2vD3DNz8nz416wJRbRDTH5DMok=",
       "radio": null,
       "uplink_enabled": true,
       "downlink_enabled": true

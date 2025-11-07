@@ -1,0 +1,10 @@
+{
+  "module_config": {
+    "_type": "meshtastic.protobuf.ModuleConfig",
+    "_data": "CiIIARINMTk1LjEzMy43NS4zMRoCbjEiAm4xKAFCA21zaFoA"
+  },
+  "owner": {
+    "_type": "meshtastic.protobuf.User",
+    "_data": "CgkhMUNBM0NBRDYSCU1RVFQgTm9kZRoEVVJBTkIgdNjTucLQXWSoT3LfuZx00pilw80QDXZDHeL7CH8m8H5IAA=="
+  }
+}

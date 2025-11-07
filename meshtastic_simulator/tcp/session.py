@@ -7,7 +7,7 @@ import time
 import random
 import threading
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 
 try:
     from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
@@ -26,28 +26,29 @@ except ImportError:
     print("Ошибка: Установите meshtastic: pip install meshtastic")
     raise
 
-from ..config import MAX_NUM_CHANNELS, NodeConfig, DEFAULT_HOP_LIMIT
+from ..config import MAX_NUM_CHANNELS, DEFAULT_HOP_LIMIT
 from ..mesh.channels import Channels
 from ..mesh.node_db import NodeDB
-from ..mesh.config_storage import ConfigStorage
+from ..mesh.config_storage import ConfigStorage, NodeConfig
 from ..mesh.persistence import Persistence
 from ..mesh.rtc import RTC, RTCQuality, RTCSetResult, get_valid_time
 from ..mqtt.client import MQTTClient
 from ..mesh import generate_node_id
+from ..mesh.pki_manager import PKIManager
+from ..mesh.settings_loader import SettingsLoader
 from ..protocol.stream_api import StreamAPI
+from ..protocol.packet_handler import PacketHandler
+from ..protocol.admin_handler import AdminMessageHandler
+from ..protocol.config_sender import ConfigSender
 from ..utils.logger import info, debug, error, warn
-
-try:
-    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-    CRYPTOGRAPHY_AVAILABLE = True
-except ImportError:
-    CRYPTOGRAPHY_AVAILABLE = False
+from ..utils.exceptions import CryptoError, PersistenceError
 
 
 class TCPConnectionSession:
     """Сессия для одного TCP подключения"""
     
-    def __init__(self, client_socket: socket.socket, client_address: tuple, node_id: Optional[str] = None, server=None):
+    def __init__(self, client_socket: socket.socket, client_address: Tuple[str, int], 
+                 node_id: Optional[str] = None, server=None) -> None:
         """
         Инициализирует сессию для TCP клиента
         
@@ -116,21 +117,17 @@ class TCPConnectionSession:
     
     def _generate_pki_keys(self):
         """Генерирует Curve25519 ключи для PKI"""
-        if not CRYPTOGRAPHY_AVAILABLE:
-            self.pki_private_key = bytes(32)
-            self.pki_public_key = bytes(32)
-            return
-        
         try:
-            private_key_obj = X25519PrivateKey.generate()
-            self.pki_private_key = private_key_obj.private_bytes_raw()
-            public_key_obj = private_key_obj.public_key()
-            self.pki_public_key = public_key_obj.public_bytes_raw()
-            debug("PKI", f"[{self._log_prefix()}] Ключи сгенерированы (public_key: {self.pki_public_key[:8].hex()}...)")
-        except Exception as e:
+            self.pki_private_key, self.pki_public_key = PKIManager.generate_keypair()
+            if self.pki_private_key is None or self.pki_public_key is None:
+                # Fallback если криптография недоступна
+                self.pki_private_key = bytes(32)
+                self.pki_public_key = bytes(32)
+                debug("PKI", f"[{self._log_prefix()}] PKI ключи не сгенерированы (криптография недоступна)")
+            else:
+                debug("PKI", f"[{self._log_prefix()}] Ключи сгенерированы (public_key: {self.pki_public_key[:8].hex()}...)")
+        except CryptoError as e:
             error("PKI", f"[{self._log_prefix()}] Ошибка генерации ключей: {e}")
-            import traceback
-            traceback.print_exc()
             self.pki_private_key = bytes(32)
             self.pki_public_key = bytes(32)
     
@@ -154,6 +151,12 @@ class TCPConnectionSession:
             # Создаем MQTT клиент с настройками из module_config или дефолтными
             # ВАЖНО: Настройки уже должны быть загружены из файла (_load_settings вызывается перед этим)
             mqtt_config = self.config_storage.module_config.mqtt
+            
+            # Проверяем, включен ли MQTT
+            mqtt_enabled = mqtt_config.enabled if hasattr(mqtt_config, 'enabled') else True
+            if not mqtt_enabled:
+                debug("MQTT", f"[{self._log_prefix()}] MQTT отключен в module_config, клиент не создается")
+                return None
             
             # Используем настройки из module_config (которые уже загружены из файла) или дефолтные
             broker = default_broker
@@ -213,90 +216,44 @@ class TCPConnectionSession:
         """Возвращает uptime в секундах для этой сессии"""
         return int(time.time() - self.created_at)
     
-    def _send_from_radio(self, from_radio):
+    def _send_from_radio(self, from_radio: mesh_pb2.FromRadio) -> None:
         """Отправляет FromRadio сообщение клиенту через TCP сокет"""
         try:
-            framed = StreamAPI.add_framing(from_radio.SerializeToString())
-            self.client_socket.send(framed)
+            payload = from_radio.SerializeToString()
+            framed = StreamAPI.add_framing(payload)
+            
+            # Определяем тип сообщения для логирования
+            msg_type = from_radio.WhichOneof('payload_variant')
+            if msg_type:
+                debug("TCP", f"[{self._log_prefix()}] Отправка FromRadio: {msg_type} (размер: {len(payload)} байт)")
+            
+            sent = self.client_socket.send(framed)
+            if sent != len(framed):
+                warn("TCP", f"[{self._log_prefix()}] Отправлено только {sent} из {len(framed)} байт")
         except Exception as e:
             error("TCP", f"[{self._log_prefix()}] Ошибка отправки FromRadio: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _load_settings(self):
         """Загружает сохраненные настройки при запуске"""
         try:
-            info("PERSISTENCE", f"[{self._log_prefix()}] Загрузка сохраненных настроек...")
-            loaded_count = 0
+            # Используем SettingsLoader для загрузки всех настроек
+            settings_loader = SettingsLoader(
+                persistence=self.persistence,
+                channels=self.channels,
+                config_storage=self.config_storage,
+                owner=self.owner,
+                pki_public_key=self.pki_public_key,
+                node_id=self.node_id
+            )
             
-            # Загружаем каналы
-            saved_channels = self.persistence.load_channels()
-            if saved_channels and len(saved_channels) == MAX_NUM_CHANNELS:
-                info("PERSISTENCE", f"[{self._log_prefix()}] Загружено {len(saved_channels)} каналов из файла")
-                # Проверяем корректность каналов перед заменой
-                valid = True
-                for i, ch in enumerate(saved_channels):
-                    if ch.index != i:
-                        warn("PERSISTENCE", f"[{self._log_prefix()}] Неверный индекс канала {i}: {ch.index}, пропускаем загрузку")
-                        valid = False
-                        break
-                if valid:
-                    self.channels.channels = saved_channels
-                    # Пересчитываем hashes
-                    self.channels.hashes = {}
-                    loaded_count += 1
-                    # Логируем статус Custom канала для диагностики
-                    if len(saved_channels) > 1:
-                        custom_ch = saved_channels[1]
-                        info("PERSISTENCE", f"[{self._log_prefix()}] Загружено {len(saved_channels)} каналов. Custom канал (index=1): downlink_enabled={custom_ch.settings.downlink_enabled}, uplink_enabled={custom_ch.settings.uplink_enabled}")
-                    else:
-                        debug("PERSISTENCE", f"[{self._log_prefix()}] Загружено {len(saved_channels)} каналов")
-            else:
-                if saved_channels:
-                    warn("PERSISTENCE", f"[{self._log_prefix()}] Неверное количество каналов: {len(saved_channels)}, ожидалось {MAX_NUM_CHANNELS}")
-                else:
-                    debug("PERSISTENCE", f"[{self._log_prefix()}] Сохраненные каналы не найдены, используются значения по умолчанию")
+            loaded_count = settings_loader.load_all()
             
-            # Загружаем Config
-            saved_config = self.persistence.load_config()
-            if saved_config:
-                info("PERSISTENCE", f"[{self._log_prefix()}] Загружен Config из файла")
-                self.config_storage.config.CopyFrom(saved_config)
-                loaded_count += 1
-            else:
-                debug("PERSISTENCE", f"[{self._log_prefix()}] Сохраненный Config не найден, используются значения по умолчанию")
-            
-            # Загружаем ModuleConfig
-            saved_module_config = self.persistence.load_module_config()
-            if saved_module_config:
-                info("PERSISTENCE", f"[{self._log_prefix()}] Загружен ModuleConfig из файла")
-                self.config_storage.module_config.CopyFrom(saved_module_config)
-                loaded_count += 1
-            else:
-                debug("PERSISTENCE", f"[{self._log_prefix()}] Сохраненный ModuleConfig не найден, используются значения по умолчанию")
-            
-            # Загружаем Owner
-            saved_owner = self.persistence.load_owner()
-            if saved_owner:
-                info("PERSISTENCE", f"[{self._log_prefix()}] Загружен Owner из файла: {saved_owner.long_name}/{saved_owner.short_name}")
-                self.owner.CopyFrom(saved_owner)
-                # Обновляем ID из node_id (как в firmware)
-                self.owner.id = self.node_id
-                # Обновляем public_key если был сгенерирован
-                if self.pki_public_key and len(self.pki_public_key) == 32:
-                    self.owner.public_key = self.pki_public_key
-                loaded_count += 1
-            else:
-                debug("PERSISTENCE", f"[{self._log_prefix()}] Сохраненный Owner не найден, используются значения по умолчанию")
-            
-            # Загружаем шаблонные сообщения
+            # Загружаем шаблонные сообщения отдельно (нужно сохранить в self.canned_messages)
             saved_canned_messages = self.persistence.load_canned_messages()
             if saved_canned_messages is not None:
                 self.canned_messages = saved_canned_messages
-                # Если есть сообщения, включаем модуль (как в firmware)
-                if saved_canned_messages:
-                    self.config_storage.module_config.canned_message.enabled = True
-                loaded_count += 1
-            else:
-                debug("PERSISTENCE", f"[{self._log_prefix()}] Сохраненные шаблонные сообщения не найдены")
             
             # ВАЖНО: MQTT клиент будет создан ПОСЛЕ загрузки настроек (в server.py),
             # поэтому здесь мы просто загружаем настройки, а клиент будет создан с правильными настройками
@@ -321,18 +278,17 @@ class TCPConnectionSession:
                 custom_ch = self.channels.get_by_index(1)
                 info("PERSISTENCE", f"[{self._log_prefix()}] Custom канал перед переподпиской: downlink_enabled={custom_ch.settings.downlink_enabled}")
                 self.mqtt_client._send_subscriptions(self.mqtt_client.client)
-            
-            if loaded_count == 0:
-                debug("PERSISTENCE", f"[{self._log_prefix()}] Используются настройки по умолчанию (файл настроек не найден или пуст)")
-            else:
-                info("PERSISTENCE", f"[{self._log_prefix()}] Загрузка настроек завершена: загружено {loaded_count} компонентов")
-        except Exception as e:
+                
+        except PersistenceError as e:
             error("PERSISTENCE", f"[{self._log_prefix()}] Ошибка загрузки настроек: {e}")
+            warn("PERSISTENCE", f"[{self._log_prefix()}] Продолжаем работу с настройками по умолчанию")
+        except Exception as e:
+            error("PERSISTENCE", f"[{self._log_prefix()}] Неожиданная ошибка загрузки настроек: {e}")
             import traceback
             traceback.print_exc()
             warn("PERSISTENCE", f"[{self._log_prefix()}] Продолжаем работу с настройками по умолчанию")
     
-    def _handle_to_radio(self, payload: bytes):
+    def _handle_to_radio(self, payload: bytes) -> None:
         """Обрабатывает ToRadio сообщение"""
         try:
             to_radio = mesh_pb2.ToRadio()
@@ -352,44 +308,28 @@ class TCPConnectionSession:
             import traceback
             traceback.print_exc()
     
-    def _handle_mesh_packet(self, packet: mesh_pb2.MeshPacket):
+    def _handle_mesh_packet(self, packet: mesh_pb2.MeshPacket) -> None:
         """Обрабатывает MeshPacket"""
         try:
-            if packet.id == 0:
-                packet.id = random.randint(1, 0xFFFFFFFF)
-            
-            # Устанавливаем hop_limit и hop_start для пакетов от клиента
-            want_ack = getattr(packet, 'want_ack', False)
-            hop_limit = getattr(packet, 'hop_limit', 0)
-            if want_ack and hop_limit == 0:
-                hop_limit = DEFAULT_HOP_LIMIT
-                packet.hop_limit = hop_limit
-                debug("TCP", f"[{self._log_prefix()}] Установлен дефолтный hop_limit={hop_limit} для пакета с want_ack=True")
-            
-            if hop_limit > 0:
-                hop_start = getattr(packet, 'hop_start', 0)
-                if hop_start == 0:
-                    packet.hop_start = hop_limit
-                    debug("TCP", f"[{self._log_prefix()}] Установлен hop_start={hop_limit} для исходящего пакета")
+            # Используем PacketHandler для подготовки пакета
+            PacketHandler.prepare_outgoing_packet(packet)
             
             payload_type = packet.WhichOneof('payload_variant')
             packet_from = getattr(packet, 'from', 0)
             hop_limit = getattr(packet, 'hop_limit', 0)
             hop_start = getattr(packet, 'hop_start', 0)
+            want_ack = getattr(packet, 'want_ack', False)
             
-            # Логируем информацию о трассировке маршрута
-            hops_away = 0
-            if hop_start != 0 and hop_limit <= hop_start:
-                hops_away = hop_start - hop_limit
-                if hops_away > 0:
-                    debug("TCP", f"[{self._log_prefix()}] Трассировка маршрута: hops_away={hops_away}, hop_start={hop_start}, hop_limit={hop_limit}")
+            # Используем PacketHandler для вычисления hops_away
+            hops_away = PacketHandler.get_hops_away(packet)
+            if hops_away > 0:
+                debug("TCP", f"[{self._log_prefix()}] Трассировка маршрута: hops_away={hops_away}, hop_start={hop_start}, hop_limit={hop_limit}")
             
             packet_to = packet.to
             debug("TCP", f"[{self._log_prefix()}] Получен MeshPacket: payload_variant={payload_type}, id={packet.id}, from={packet_from:08X}, to={packet_to:08X}, channel={packet.channel}, want_ack={want_ack}, hop_limit={hop_limit}, hop_start={hop_start}, hops_away={hops_away}")
             
-            if (payload_type == 'decoded' and 
-                hasattr(packet.decoded, 'portnum') and
-                packet.decoded.portnum == portnums_pb2.PortNum.ADMIN_APP):
+            # Используем PacketHandler для проверки Admin пакета
+            if PacketHandler.is_admin_packet(packet):
                 debug("TCP", f"[{self._log_prefix()}] AdminMessage обнаружен, передача в обработчик (want_response={getattr(packet.decoded, 'want_response', False)})")
                 self._handle_admin_message(packet)
             
@@ -397,25 +337,17 @@ class TCPConnectionSession:
             if self.mqtt_client:
                 self.mqtt_client.publish_packet(packet, channel_index)
             
-            # Отправляем ACK если запрошено
-            if want_ack and payload_type == 'decoded':
-                is_routing_ack = (hasattr(packet.decoded, 'portnum') and 
-                                 packet.decoded.portnum == portnums_pb2.PortNum.ROUTING_APP and
-                                 hasattr(packet.decoded, 'request_id') and 
-                                 packet.decoded.request_id != 0)
-                
-                if not is_routing_ack:
-                    portnum_name = packet.decoded.portnum if hasattr(packet.decoded, 'portnum') else 'N/A'
-                    debug("ACK", f"[{self._log_prefix()}] Отправка ACK для пакета {packet.id} (portnum={portnum_name}, from={packet_from:08X})")
-                    self._send_ack(packet, channel_index)
-                else:
-                    debug("ACK", f"[{self._log_prefix()}] Пропуск ACK для Routing пакета {packet.id} (это уже ACK)")
+            # Используем PacketHandler для проверки необходимости отправки ACK
+            if PacketHandler.should_send_ack(packet):
+                portnum_name = packet.decoded.portnum if hasattr(packet.decoded, 'portnum') else 'N/A'
+                debug("ACK", f"[{self._log_prefix()}] Отправка ACK для пакета {packet.id} (portnum={portnum_name}, from={packet_from:08X})")
+                self._send_ack(packet, channel_index)
         except Exception as e:
             error("TCP", f"[{self._log_prefix()}] Ошибка обработки MeshPacket: {e}")
             import traceback
             traceback.print_exc()
     
-    def _handle_mqtt_packet(self, packet: mesh_pb2.MeshPacket):
+    def _handle_mqtt_packet(self, packet: mesh_pb2.MeshPacket) -> None:
         """Обрабатывает MeshPacket полученный из MQTT"""
         try:
             # Устанавливаем rx_time при получении пакета (используем RTC этой сессии)
@@ -462,29 +394,11 @@ class TCPConnectionSession:
             import traceback
             traceback.print_exc()
     
-    def _send_ack(self, packet: mesh_pb2.MeshPacket, channel_index: int):
+    def _send_ack(self, packet: mesh_pb2.MeshPacket, channel_index: int) -> None:
         """Отправляет ACK пакет обратно клиенту"""
         try:
-            packet_from = getattr(packet, 'from', 0)
-            packet_to = packet.to
-            packet_id = packet.id
-            hop_limit = 0  # TCP клиент - прямое соединение
-            
-            routing_msg = mesh_pb2.Routing()
-            routing_msg.error_reason = mesh_pb2.Routing.Error.NONE
-            
-            ack_packet = mesh_pb2.MeshPacket()
-            ack_packet.id = random.randint(1, 0xFFFFFFFF)
-            ack_packet.to = packet_from
-            setattr(ack_packet, 'from', self.node_num)
-            ack_packet.channel = channel_index
-            ack_packet.decoded.portnum = portnums_pb2.PortNum.ROUTING_APP
-            ack_packet.decoded.request_id = packet_id
-            ack_packet.decoded.payload = routing_msg.SerializeToString()
-            ack_packet.priority = mesh_pb2.MeshPacket.Priority.ACK
-            ack_packet.hop_limit = hop_limit
-            ack_packet.want_ack = False
-            ack_packet.hop_start = hop_limit
+            # Используем PacketHandler для создания ACK пакета
+            ack_packet = PacketHandler.create_ack_packet(packet, self.node_num, channel_index)
             
             def send_ack_delayed():
                 time.sleep(0.1)  # 100ms задержка
@@ -492,8 +406,10 @@ class TCPConnectionSession:
                     from_radio = mesh_pb2.FromRadio()
                     from_radio.packet.CopyFrom(ack_packet)
                     self._send_from_radio(from_radio)
+                    packet_from = getattr(packet, 'from', 0)
+                    packet_to = packet.to
                     is_broadcast = packet_to == 0xFFFFFFFF
-                    debug("ACK", f"[{self._log_prefix()}] Отправлен ACK (async): packet_id={ack_packet.id}, request_id={packet_id}, to={packet_from:08X}, from={self.node_num:08X}, channel={channel_index}, packet_to={packet_to:08X}, broadcast={is_broadcast}, error_reason=NONE")
+                    debug("ACK", f"[{self._log_prefix()}] Отправлен ACK (async): packet_id={ack_packet.id}, request_id={packet.id}, to={packet_from:08X}, from={self.node_num:08X}, channel={channel_index}, packet_to={packet_to:08X}, broadcast={is_broadcast}, error_reason=NONE")
                 except Exception as e:
                     error("ACK", f"[{self._log_prefix()}] Ошибка отправки ACK (async): {e}")
             
@@ -501,13 +417,13 @@ class TCPConnectionSession:
             ack_thread = threading.Thread(target=send_ack_delayed, daemon=True)
             ack_thread.start()
             
-            debug("ACK", f"[{self._log_prefix()}] Запущена асинхронная отправка ACK для пакета {packet_id} (задержка 100ms)")
+            debug("ACK", f"[{self._log_prefix()}] Запущена асинхронная отправка ACK для пакета {packet.id} (задержка 100ms)")
         except Exception as e:
             error("ACK", f"[{self._log_prefix()}] Ошибка отправки ACK: {e}")
             import traceback
             traceback.print_exc()
     
-    def _handle_admin_message(self, packet: mesh_pb2.MeshPacket):
+    def _handle_admin_message(self, packet: mesh_pb2.MeshPacket) -> None:
         """Обрабатывает AdminMessage из MeshPacket"""
         try:
             admin_msg = admin_pb2.AdminMessage()
@@ -554,10 +470,37 @@ class TCPConnectionSession:
                 self.persistence.save_module_config(self.config_storage.module_config)
                 debug("ADMIN", f"[{self._log_prefix()}] Конфигурация модуля сохранена в ConfigStorage")
                 
-                if module_type == 'mqtt' and self.mqtt_client:
-                    info("MQTT", f"[{self._log_prefix()}] Конфигурация MQTT изменена, обновляем настройки...")
+                if module_type == 'mqtt':
                     mqtt_config = admin_msg.set_module_config.mqtt
-                    self.mqtt_client.update_config(mqtt_config)
+                    mqtt_enabled = mqtt_config.enabled if hasattr(mqtt_config, 'enabled') else True
+                    
+                    if mqtt_enabled:
+                        # MQTT включен - создаем или обновляем клиент
+                        if self.mqtt_client:
+                            info("MQTT", f"[{self._log_prefix()}] MQTT включен, обновляем настройки...")
+                            self.mqtt_client.update_config(mqtt_config)
+                        else:
+                            # Создаем MQTT клиент если его еще нет
+                            info("MQTT", f"[{self._log_prefix()}] MQTT включен, создаем клиент...")
+                            from ..tcp.server import TCPServer
+                            if self.server:
+                                self.mqtt_client = self.get_or_create_mqtt_client(
+                                    default_broker=self.server.default_mqtt_broker,
+                                    default_port=self.server.default_mqtt_port,
+                                    default_username=self.server.default_mqtt_username,
+                                    default_password=self.server.default_mqtt_password,
+                                    default_root=self.server.default_mqtt_root
+                                )
+                            else:
+                                warn("MQTT", f"[{self._log_prefix()}] Не удалось создать MQTT клиент: server не установлен")
+                    else:
+                        # MQTT выключен - останавливаем клиент
+                        if self.mqtt_client:
+                            info("MQTT", f"[{self._log_prefix()}] MQTT выключен, останавливаем клиент...")
+                            self.mqtt_client.stop()
+                            self.mqtt_client = None
+                        else:
+                            debug("MQTT", f"[{self._log_prefix()}] MQTT выключен, клиент уже не существует")
             
             elif admin_msg.HasField('get_channel_request'):
                 requested_index = admin_msg.get_channel_request
@@ -579,18 +522,8 @@ class TCPConnectionSession:
                         admin_response.get_channel_response.index = ch_index
                         debug("ADMIN", f"[{self._log_prefix()}] Исправлен index канала: {admin_response.get_channel_response.index}")
                     
-                    reply_packet = mesh_pb2.MeshPacket()
-                    reply_packet.id = random.randint(1, 0xFFFFFFFF)
-                    
-                    packet_from = getattr(packet, 'from', 0)
-                    reply_packet.to = packet_from
-                    setattr(reply_packet, 'from', self.node_num)
-                    reply_packet.channel = packet.channel
-                    reply_packet.decoded.request_id = packet.id
-                    reply_packet.want_ack = False
-                    reply_packet.priority = mesh_pb2.MeshPacket.Priority.RELIABLE
-                    reply_packet.decoded.portnum = portnums_pb2.PortNum.ADMIN_APP
-                    reply_packet.decoded.payload = admin_response.SerializeToString()
+                    # Используем AdminMessageHandler для создания reply пакета
+                    reply_packet = AdminMessageHandler.create_reply_packet(packet, admin_response, self.node_num)
                     
                     from_radio = mesh_pb2.FromRadio()
                     from_radio.packet.CopyFrom(reply_packet)
@@ -615,18 +548,8 @@ class TCPConnectionSession:
                 admin_response = admin_pb2.AdminMessage()
                 admin_response.get_config_response.CopyFrom(config_response)
                 
-                reply_packet = mesh_pb2.MeshPacket()
-                reply_packet.id = random.randint(1, 0xFFFFFFFF)
-                
-                packet_from = getattr(packet, 'from', 0)
-                reply_packet.to = packet_from
-                setattr(reply_packet, 'from', self.node_num)
-                reply_packet.channel = packet.channel
-                reply_packet.decoded.request_id = packet.id
-                reply_packet.want_ack = False
-                reply_packet.priority = mesh_pb2.MeshPacket.Priority.RELIABLE
-                reply_packet.decoded.portnum = portnums_pb2.PortNum.ADMIN_APP
-                reply_packet.decoded.payload = admin_response.SerializeToString()
+                # Используем AdminMessageHandler для создания reply пакета
+                reply_packet = AdminMessageHandler.create_reply_packet(packet, admin_response, self.node_num)
                 
                 from_radio = mesh_pb2.FromRadio()
                 from_radio.packet.CopyFrom(reply_packet)
@@ -655,18 +578,8 @@ class TCPConnectionSession:
                 admin_response = admin_pb2.AdminMessage()
                 admin_response.get_module_config_response.CopyFrom(module_config_response)
                 
-                reply_packet = mesh_pb2.MeshPacket()
-                reply_packet.id = random.randint(1, 0xFFFFFFFF)
-                
-                packet_from = getattr(packet, 'from', 0)
-                reply_packet.to = packet_from
-                setattr(reply_packet, 'from', self.node_num)
-                reply_packet.channel = packet.channel
-                reply_packet.decoded.request_id = packet.id
-                reply_packet.want_ack = False
-                reply_packet.priority = mesh_pb2.MeshPacket.Priority.RELIABLE
-                reply_packet.decoded.portnum = portnums_pb2.PortNum.ADMIN_APP
-                reply_packet.decoded.payload = admin_response.SerializeToString()
+                # Используем AdminMessageHandler для создания reply пакета
+                reply_packet = AdminMessageHandler.create_reply_packet(packet, admin_response, self.node_num)
                 
                 from_radio = mesh_pb2.FromRadio()
                 from_radio.packet.CopyFrom(reply_packet)
@@ -691,18 +604,8 @@ class TCPConnectionSession:
                 admin_response = admin_pb2.AdminMessage()
                 admin_response.get_canned_message_module_messages_response = messages
                 
-                reply_packet = mesh_pb2.MeshPacket()
-                reply_packet.id = random.randint(1, 0xFFFFFFFF)
-                
-                packet_from = getattr(packet, 'from', 0)
-                reply_packet.to = packet_from
-                setattr(reply_packet, 'from', self.node_num)
-                reply_packet.channel = packet.channel
-                reply_packet.decoded.request_id = packet.id
-                reply_packet.want_ack = False
-                reply_packet.priority = mesh_pb2.MeshPacket.Priority.RELIABLE
-                reply_packet.decoded.portnum = portnums_pb2.PortNum.ADMIN_APP
-                reply_packet.decoded.payload = admin_response.SerializeToString()
+                # Используем AdminMessageHandler для создания reply пакета
+                reply_packet = AdminMessageHandler.create_reply_packet(packet, admin_response, self.node_num)
                 
                 from_radio = mesh_pb2.FromRadio()
                 from_radio.packet.CopyFrom(reply_packet)
@@ -731,18 +634,8 @@ class TCPConnectionSession:
                 admin_response = admin_pb2.AdminMessage()
                 admin_response.get_owner_response.CopyFrom(self.owner)
                 
-                reply_packet = mesh_pb2.MeshPacket()
-                reply_packet.id = random.randint(1, 0xFFFFFFFF)
-                
-                packet_from = getattr(packet, 'from', 0)
-                reply_packet.to = packet_from
-                setattr(reply_packet, 'from', self.node_num)
-                reply_packet.channel = packet.channel
-                reply_packet.decoded.request_id = packet.id
-                reply_packet.want_ack = False
-                reply_packet.priority = mesh_pb2.MeshPacket.Priority.RELIABLE
-                reply_packet.decoded.portnum = portnums_pb2.PortNum.ADMIN_APP
-                reply_packet.decoded.payload = admin_response.SerializeToString()
+                # Используем AdminMessageHandler для создания reply пакета
+                reply_packet = AdminMessageHandler.create_reply_packet(packet, admin_response, self.node_num)
                 
                 from_radio = mesh_pb2.FromRadio()
                 from_radio.packet.CopyFrom(reply_packet)
@@ -781,18 +674,8 @@ class TCPConnectionSession:
                 admin_response = admin_pb2.AdminMessage()
                 admin_response.get_device_metadata_response.CopyFrom(device_metadata)
                 
-                reply_packet = mesh_pb2.MeshPacket()
-                reply_packet.id = random.randint(1, 0xFFFFFFFF)
-                
-                packet_from = getattr(packet, 'from', 0)
-                reply_packet.to = packet_from
-                setattr(reply_packet, 'from', self.node_num)
-                reply_packet.channel = packet.channel
-                reply_packet.decoded.request_id = packet.id
-                reply_packet.want_ack = False
-                reply_packet.priority = mesh_pb2.MeshPacket.Priority.RELIABLE
-                reply_packet.decoded.portnum = portnums_pb2.PortNum.ADMIN_APP
-                reply_packet.decoded.payload = admin_response.SerializeToString()
+                # Используем AdminMessageHandler для создания reply пакета
+                reply_packet = AdminMessageHandler.create_reply_packet(packet, admin_response, self.node_num)
                 
                 from_radio = mesh_pb2.FromRadio()
                 from_radio.packet.CopyFrom(reply_packet)
@@ -815,15 +698,11 @@ class TCPConnectionSession:
             import traceback
             traceback.print_exc()
     
-    def _send_config(self, config_nonce: int):
+    def _send_config(self, config_nonce: int) -> None:
         """Отправляет конфигурацию клиенту"""
         info("CONFIG", f"[{self._log_prefix()}] Отправка конфигурации (nonce: {config_nonce})")
         
-        # 1. MyInfo
-        my_info = mesh_pb2.MyNodeInfo()
-        my_info.my_node_num = self.node_num & 0x7FFFFFFF
-        
-        # Устанавливаем device_id
+        # Устанавливаем device_id и проверяем маппинг ДО начала отправки конфигурации
         if not hasattr(self, '_device_id') or not self._device_id:
             device_id_bytes = bytearray(16)
             try:
@@ -841,6 +720,7 @@ class TCPConnectionSession:
             debug("CONFIG", f"[{self._log_prefix()}] Device ID установлен: {self._device_id.hex()}")
             
             # Обновляем маппинг device_id -> node_id для сохранения настроек между переподключениями
+            # ВАЖНО: Делаем это ДО начала отправки конфигурации, чтобы не прерывать процесс
             if self.server:
                 device_id_hex = self._device_id.hex()
                 with self.server.device_id_lock:
@@ -856,138 +736,64 @@ class TCPConnectionSession:
                                 self.node_num = self.node_num & 0x7FFFFFFF
                             except:
                                 pass
+                            # Обновляем маппинг IP -> node_id для сохранения между перезапусками
+                            if self.server and self.client_address:
+                                client_ip = self.client_address[0]
+                                self.server.ip_to_node_id[client_ip] = self.node_id
+                                self.server._save_ip_mapping()
                             # Обновляем Persistence для использования правильного файла
                             self.persistence = Persistence(node_id=self.node_id)
-                            # Перезагружаем настройки с правильным node_id
+                            # Перезагружаем настройки с правильным node_id (но НЕ создаем новый MQTT клиент)
+                            # Просто обновляем настройки, которые уже загружены
                             self._load_settings()
                     else:
                         # Сохраняем новый маппинг device_id -> node_id
                         self.server.device_id_to_node_id[device_id_hex] = self.node_id
                         self.server._save_device_id_mapping()
+                        # Также обновляем маппинг IP -> node_id для сохранения между перезапусками
+                        if self.client_address:
+                            client_ip = self.client_address[0]
+                            self.server.ip_to_node_id[client_ip] = self.node_id
+                            self.server._save_ip_mapping()
                         info("CONFIG", f"[{self._log_prefix()}] Сохранен маппинг device_id -> node_id: {device_id_hex[:16]}... -> {self.node_id}")
         
-        my_info.device_id = self._device_id
+        # Используем ConfigSender для отправки конфигурации
+        config_sender = ConfigSender(
+            node_id=self.node_id,
+            node_num=self.node_num,
+            owner=self.owner,
+            channels=self.channels,
+            config_storage=self.config_storage,
+            node_db=self.node_db,
+            pki_public_key=self.pki_public_key,
+            rtc=self.rtc,
+            send_from_radio_callback=self._send_from_radio,
+            device_id=self._device_id
+        )
+        config_sender.send_config(config_nonce)
         
-        from_radio = mesh_pb2.FromRadio()
-        from_radio.my_info.CopyFrom(my_info)
-        self._send_from_radio(from_radio)
-        
-        # 2. NodeInfo
-        node_info = mesh_pb2.NodeInfo()
-        node_info.num = self.node_num & 0x7FFFFFFF
-        node_info.user.id = self.owner.id
-        node_info.user.long_name = self.owner.long_name
-        node_info.user.short_name = self.owner.short_name
-        node_info.user.is_licensed = self.owner.is_licensed
-        if self.owner.public_key and len(self.owner.public_key) > 0:
-            if not self.owner.is_licensed:
-                node_info.user.public_key = self.owner.public_key
-        try:
-            if NodeConfig.HW_MODEL == "PORTDUINO":
-                node_info.user.hw_model = mesh_pb2.HardwareModel.PORTDUINO
-            else:
-                hw_model_attr = getattr(mesh_pb2.HardwareModel, NodeConfig.HW_MODEL, None)
-                if hw_model_attr is not None:
-                    node_info.user.hw_model = hw_model_attr
-                else:
-                    node_info.user.hw_model = mesh_pb2.HardwareModel.PORTDUINO
-        except Exception as e:
-            debug("CONFIG", f"[{self._log_prefix()}] Не удалось установить hw_model: {e}")
-        
-        if self.pki_public_key and len(self.pki_public_key) == 32:
-            node_info.user.public_key = self.pki_public_key
-            info("PKI", f"[{self._log_prefix()}] Публичный ключ добавлен в NodeInfo ({self.pki_public_key[:8].hex()}...)")
-        
-        if telemetry_pb2:
-            try:
-                our_node = self.node_db.get_mesh_node(self.node_num)
-                if our_node and hasattr(our_node, 'device_metrics'):
-                    node_info.device_metrics.CopyFrom(our_node.device_metrics)
-                else:
-                    device_metrics = telemetry_pb2.DeviceMetrics()
-                    device_metrics.battery_level = NodeConfig.DEVICE_METRICS_BATTERY_LEVEL
-                    device_metrics.voltage = NodeConfig.DEVICE_METRICS_VOLTAGE
-                    device_metrics.channel_utilization = NodeConfig.DEVICE_METRICS_CHANNEL_UTILIZATION
-                    device_metrics.air_util_tx = NodeConfig.DEVICE_METRICS_AIR_UTIL_TX
-                    current_time = self.rtc.get_time()
-                    if current_time > 0:
-                        device_metrics.uptime_seconds = current_time % (365 * 24 * 3600)
-                    else:
-                        device_metrics.uptime_seconds = self.get_uptime_seconds()
-                    node_info.device_metrics.CopyFrom(device_metrics)
-                    
-                    if our_node:
-                        our_node.device_metrics.CopyFrom(device_metrics)
-                    else:
-                        our_node = self.node_db.get_or_create_mesh_node(self.node_num)
-                        our_node.device_metrics.CopyFrom(device_metrics)
-            except Exception as e:
-                error("CONFIG", f"[{self._log_prefix()}] Ошибка добавления device_metrics: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        from_radio = mesh_pb2.FromRadio()
-        from_radio.node_info.CopyFrom(node_info)
-        self._send_from_radio(from_radio)
-        
-        # 3. Metadata
-        metadata = mesh_pb2.DeviceMetadata()
-        metadata.firmware_version = NodeConfig.FIRMWARE_VERSION
-        metadata.device_state_version = 1
-        metadata.canShutdown = True
-        metadata.hasWifi = False
-        metadata.hasBluetooth = False
-        metadata.hasEthernet = True
-        metadata.role = self.config_storage.config.device.role
-        metadata.position_flags = self.config_storage.config.position.position_flags
-        try:
-            if NodeConfig.HW_MODEL == "PORTDUINO":
-                metadata.hw_model = mesh_pb2.HardwareModel.PORTDUINO
-            else:
-                hw_model_attr = getattr(mesh_pb2.HardwareModel, NodeConfig.HW_MODEL, None)
-                if hw_model_attr is not None:
-                    metadata.hw_model = hw_model_attr
-        except Exception as e:
-            debug("CONFIG", f"[{self._log_prefix()}] Не удалось установить hw_model в DeviceMetadata: {e}")
-        metadata.hasRemoteHardware = self.config_storage.module_config.remote_hardware.enabled
-        metadata.hasPKC = CRYPTOGRAPHY_AVAILABLE
-        
-        from_radio = mesh_pb2.FromRadio()
-        from_radio.metadata.CopyFrom(metadata)
-        self._send_from_radio(from_radio)
-        
-        # 4. Channels
-        for i in range(MAX_NUM_CHANNELS):
-            channel = self.channels.get_by_index(i)
-            from_radio = mesh_pb2.FromRadio()
-            from_radio.channel.CopyFrom(channel)
-            self._send_from_radio(from_radio)
-        
-        # 5. Other NodeInfos
-        all_nodes = self.node_db.get_all_nodes()
-        if all_nodes:
-            info("CONFIG", f"[{self._log_prefix()}] Отправка информации о {len(all_nodes)} узлах")
-            for node_info in all_nodes:
-                from_radio = mesh_pb2.FromRadio()
-                from_radio.node_info.CopyFrom(node_info)
-                self._send_from_radio(from_radio)
-        
-        # 6. Config complete
-        from_radio = mesh_pb2.FromRadio()
-        from_radio.config_complete_id = config_nonce
-        self._send_from_radio(from_radio)
+        info("CONFIG", f"[{self._log_prefix()}] Конфигурация отправлена полностью (nonce: {config_nonce})")
     
-    def close(self):
+    def close(self) -> None:
         """Закрывает сессию и очищает ресурсы"""
+        # Останавливаем MQTT клиент ПЕРЕД закрытием сокета
         if self.mqtt_client:
-            self.mqtt_client.stop()
-            self.mqtt_client = None
+            try:
+                self.mqtt_client.stop()
+            except Exception as e:
+                warn("SESSION", f"[{self._log_prefix()}] Ошибка остановки MQTT клиента: {e}")
+            finally:
+                self.mqtt_client = None
         
+        # Закрываем TCP сокет
         if self.client_socket:
             try:
                 self.client_socket.close()
             except:
                 pass
+        
+        # Даем время на завершение всех потоков
+        time.sleep(0.1)
         
         info("SESSION", f"[{self._log_prefix()}] Сессия закрыта")
 
