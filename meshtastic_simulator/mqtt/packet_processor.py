@@ -579,7 +579,8 @@ class MQTTPacketProcessor:
                         # Отправляем телеметрию отдельным пакетом, если она есть
                         if has_telemetry_after and node_info.HasField('device_metrics'):
                             try:
-                                from meshtastic.protobuf import telemetry_pb2, portnums_pb2
+                                # portnums_pb2 уже импортирован на уровне модуля, импортируем только telemetry_pb2
+                                from meshtastic.protobuf import telemetry_pb2
                                 if telemetry_pb2 and portnums_pb2:
                                     # Создаем Telemetry пакет (как в firmware DeviceTelemetryModule)
                                     telemetry = telemetry_pb2.Telemetry()
@@ -869,7 +870,7 @@ class MQTTPacketProcessor:
             import random
             import time
             from ..config import DEFAULT_HOP_LIMIT
-            from meshtastic.protobuf import portnums_pb2
+            # portnums_pb2 уже импортирован на уровне модуля
             
             # Проверяем, не отправляли ли мы NodeInfo этому узлу недавно (чтобы не спамить)
             # В firmware это контролируется через throttling, но мы делаем простую проверку
