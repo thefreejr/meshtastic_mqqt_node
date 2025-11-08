@@ -712,33 +712,62 @@ class MQTTPacketProcessor:
             
             # ВАЖНО: Отправляем ACK/NAK для пакетов с want_ack=true, полученных через MQTT
             # (как в firmware ReliableRouter::sniffReceived - проверяет want_ack и отправляет ACK/NAK)
-            if payload_type == 'decoded' and packet.want_ack:
-                packet_to = packet.to
-                is_broadcast = (packet_to == 0xFFFFFFFF or packet_to == 0xFFFFFFFE)
-                is_to_us = (packet_to == our_node_num) if not is_broadcast else False
-                
+            # ВАЖНО: ACK отправляется не только для decoded пакетов, но и для encrypted пакетов,
+            # которые адресованы нам, но не могут быть расшифрованы (с ошибкой NO_CHANNEL или PKI_UNKNOWN_PUBKEY)
+            packet_to = packet.to
+            is_broadcast = (packet_to == 0xFFFFFFFF or packet_to == 0xFFFFFFFE)
+            is_to_us = (packet_to == our_node_num) if not is_broadcast else False
+            
+            if packet.want_ack and is_to_us and not is_broadcast:
                 # Проверяем, что это не ACK сам по себе (Routing сообщение с request_id)
-                is_routing_ack = (
-                    hasattr(packet.decoded, 'portnum') and 
-                    packet.decoded.portnum == portnums_pb2.PortNum.ROUTING_APP and
-                    hasattr(packet.decoded, 'request_id') and 
-                    packet.decoded.request_id != 0
-                )
+                is_routing_ack = False
+                if payload_type == 'decoded':
+                    is_routing_ack = (
+                        hasattr(packet.decoded, 'portnum') and 
+                        packet.decoded.portnum == portnums_pb2.PortNum.ROUTING_APP and
+                        hasattr(packet.decoded, 'request_id') and 
+                        packet.decoded.request_id != 0
+                    )
                 
                 # Отправляем ACK только если:
                 # 1. Пакет адресован нам (не broadcast)
                 # 2. Это не ACK сам по себе
-                # 3. Это не Admin пакет (Admin пакеты обрабатываются отдельно)
-                is_admin = (hasattr(packet.decoded, 'portnum') and 
-                           packet.decoded.portnum == portnums_pb2.PortNum.ADMIN_APP)
+                # 3. Для decoded пакетов - это не Admin пакет (Admin пакеты обрабатываются отдельно)
+                is_admin = False
+                if payload_type == 'decoded':
+                    is_admin = (hasattr(packet.decoded, 'portnum') and 
+                               packet.decoded.portnum == portnums_pb2.PortNum.ADMIN_APP)
                 
-                if not is_routing_ack and is_to_us and not is_admin:
+                if not is_routing_ack and not is_admin:
                     try:
-                        # Создаем ACK пакет (как в firmware MeshModule::allocAckNak)
+                        # Определяем тип ошибки для NAK (как в firmware ReliableRouter::sniffReceived)
+                        # Если пакет не расшифрован и адресован нам, отправляем NAK с соответствующей ошибкой
+                        ack_error = None  # По умолчанию ACK (NONE)
+                        
+                        if payload_type == 'encrypted':
+                            # Пакет не расшифрован - отправляем NAK с ошибкой
+                            # Проверяем, является ли это PKI пакетом (channel == 0)
+                            if packet.channel == 0:
+                                # PKI пакет - проверяем наличие публичного ключа
+                                from_node = self.node_db.get_mesh_node(packet_from) if self.node_db else None
+                                if not from_node or not hasattr(from_node.user, 'public_key') or len(from_node.user.public_key) != 32:
+                                    ack_error = mesh_pb2.Routing.Error.PKI_UNKNOWN_PUBKEY
+                                    info("ACK", f"PKI packet from !{packet_from:08X} without public key, sending PKI_UNKNOWN_PUBKEY NAK")
+                                else:
+                                    # PKI пакет, но не расшифрован - возможно, проблема с ключом получателя
+                                    ack_error = mesh_pb2.Routing.Error.NO_CHANNEL
+                                    debug("ACK", f"PKI packet from !{packet_from:08X} not decrypted, sending NO_CHANNEL NAK")
+                            else:
+                                # Обычный зашифрованный пакет - нет канала для расшифровки
+                                ack_error = mesh_pb2.Routing.Error.NO_CHANNEL
+                                debug("ACK", f"Encrypted packet from !{packet_from:08X} not decrypted, sending NO_CHANNEL NAK")
+                        
+                        # Создаем ACK/NAK пакет (как в firmware MeshModule::allocAckNak)
                         ack_packet = PacketHandler.create_ack_packet(
                             packet, 
                             our_node_num, 
-                            packet.channel if packet.channel < 8 else 0
+                            packet.channel if packet.channel < 8 else 0,
+                            ack_error  # Передаем ошибку для NAK (None = ACK)
                         )
                         
                         # Находим сессию получателя (наша сессия) для отправки ACK через MQTT
@@ -754,7 +783,10 @@ class MQTTPacketProcessor:
                         if receiver_session and receiver_session.mqtt_client and receiver_session.mqtt_client.connected:
                             channel_index = packet.channel if packet.channel < 8 else 0
                             receiver_session.mqtt_client.publish_packet(ack_packet, channel_index)
-                            info("ACK", f"Sent ACK via MQTT for packet {packet.id} from !{packet_from:08X} to !{packet_to:08X} (request_id={ack_packet.decoded.request_id})")
+                            if ack_error is None:
+                                info("ACK", f"Sent ACK via MQTT for packet {packet.id} from !{packet_from:08X} to !{packet_to:08X} (request_id={ack_packet.decoded.request_id})")
+                            else:
+                                info("ACK", f"Sent NAK via MQTT for packet {packet.id} from !{packet_from:08X} to !{packet_to:08X} (error={ack_error}, request_id={ack_packet.decoded.request_id})")
                         else:
                             debug("ACK", f"Could not send ACK via MQTT: receiver_session not found or MQTT not connected")
                     except Exception as e:
@@ -917,10 +949,19 @@ class MQTTPacketProcessor:
             user.short_name = receiver_session.owner.short_name
             user.is_licensed = receiver_session.owner.is_licensed
             
-            # Публичный ключ (если не лицензирован)
+            # ВАЖНО: Публичный ключ (если не лицензирован)
+            # Всегда включаем публичный ключ из сессии, если он есть
             if receiver_session.owner.public_key and len(receiver_session.owner.public_key) > 0:
                 if not receiver_session.owner.is_licensed:
                     user.public_key = receiver_session.owner.public_key
+            # ВАЖНО: Также проверяем NodeDB получателя - возможно, там есть ключ, который нужно включить
+            # (на случай, если сессия не имеет ключа, но мы его уже знаем)
+            elif self.node_db:
+                receiver_node = self.node_db.get_mesh_node(receiver_session.node_num)
+                if receiver_node and hasattr(receiver_node.user, 'public_key') and len(receiver_node.user.public_key) == 32:
+                    if not receiver_session.owner.is_licensed:
+                        user.public_key = receiver_node.user.public_key
+                        debug("MQTT", f"Включен public_key из NodeDB получателя для NodeInfo к !{sender_node_num:08X}")
             
             # Создаем MeshPacket с User payload (portnum=NODEINFO_APP)
             packet = mesh_pb2.MeshPacket()

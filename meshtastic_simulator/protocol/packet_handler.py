@@ -76,25 +76,30 @@ class PacketHandler:
     @staticmethod
     def create_ack_packet(original_packet: mesh_pb2.MeshPacket, 
                           our_node_num: int, 
-                          channel_index: int) -> mesh_pb2.MeshPacket:
+                          channel_index: int,
+                          error_reason: int = None) -> mesh_pb2.MeshPacket:
         """
-        Создает ACK пакет для исходного пакета
+        Создает ACK/NAK пакет для исходного пакета
         
         Args:
-            original_packet: Исходный пакет, для которого создается ACK
+            original_packet: Исходный пакет, для которого создается ACK/NAK
             our_node_num: Наш node_num (для поля from)
             channel_index: Индекс канала
+            error_reason: Причина ошибки для NAK (Routing.Error), если None - ACK (NONE)
             
         Returns:
-            MeshPacket с ACK
+            MeshPacket с ACK/NAK
         """
         packet_from = getattr(original_packet, 'from', 0)
         packet_id = original_packet.id
         hop_limit = 0  # TCP клиент - прямое соединение
         
-        # Создаем Routing сообщение с ACK
+        # Создаем Routing сообщение с ACK/NAK
         routing_msg = mesh_pb2.Routing()
-        routing_msg.error_reason = mesh_pb2.Routing.Error.NONE  # ACK = нет ошибки
+        if error_reason is None:
+            routing_msg.error_reason = mesh_pb2.Routing.Error.NONE  # ACK = нет ошибки
+        else:
+            routing_msg.error_reason = error_reason  # NAK = ошибка
         
         # Создаем MeshPacket с ACK
         ack_packet = mesh_pb2.MeshPacket()
