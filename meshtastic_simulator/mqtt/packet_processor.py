@@ -30,6 +30,7 @@ from ..mesh.channels import Channels
 from ..mesh.node_db import NodeDB
 from ..mesh.rtc import RTCQuality, get_valid_time
 from ..protocol.stream_api import StreamAPI
+from ..protocol.packet_handler import PacketHandler
 from ..utils.logger import info, debug, error, warn
 
 
@@ -107,17 +108,80 @@ class MQTTPacketProcessor:
             # gateway_id - это node_id отправителя пакета в MQTT (того, кто опубликовал)
             # Если gateway_id == наш node_id, это пакет, который мы сами отправили
             # НО: если packet.to указывает на нас (не broadcast), это пакет для нас от другого узла - обрабатываем!
+            # ВАЖНО: ACK пакеты (ROUTING_APP с request_id) всегда обрабатываем, даже если gateway_id совпадает,
+            # так как это ответ на наш запрос (как в firmware - ACK обрабатываются даже если от собственного gateway)
             is_own_gateway = self._is_own_packet(envelope.gateway_id)
             is_for_us = (envelope_to != 0xFFFFFFFF and envelope_to == our_node_num)
             
-            # Игнорируем только если это наш собственный пакет И он не адресован нам напрямую
+            # Проверяем, является ли это ACK пакетом (ROUTING_APP с request_id)
+            is_ack_packet = False
+            if envelope.packet and hasattr(envelope.packet, 'decoded'):
+                if (hasattr(envelope.packet.decoded, 'portnum') and 
+                    envelope.packet.decoded.portnum == portnums_pb2.PortNum.ROUTING_APP and
+                    hasattr(envelope.packet.decoded, 'request_id') and 
+                    envelope.packet.decoded.request_id != 0):
+                    is_ack_packet = True
+            
+            # ВАЖНО: Если это наш собственный пакет (gateway_id совпадает) и он от нас (isFromUs),
+            # отправляем implicit ACK локально клиенту (как в firmware MQTT.cpp:66-70)
+            # Это нужно для того, чтобы клиент знал, что пакет был доставлен хотя бы одному узлу
+            if is_own_gateway and envelope.packet:
+                # Проверяем, является ли пакет от нас (packet.from == наш node_num)
+                packet_from_envelope = getattr(envelope.packet, 'from', 0)
+                is_from_us = (packet_from_envelope == our_node_num)
+                
+                if is_from_us:
+                    # Это наш собственный пакет - отправляем implicit ACK локально клиенту
+                    # (как в firmware: "Generate an implicit ACK towards ourselves (handled and processed only locally!)")
+                    try:
+                        # Находим сессию отправителя для отправки локального ACK
+                        sender_node_id = self.node_id if isinstance(self.node_id, str) else f"!{self.node_id:08X}"
+                        sender_session = None
+                        if self.server:
+                            with self.server.sessions_lock:
+                                for session in self.server.active_sessions.values():
+                                    if session.node_id == sender_node_id:
+                                        sender_session = session
+                                        break
+                        
+                        if sender_session and envelope.packet.want_ack:
+                            # Создаем локальный ACK для клиента (не через MQTT, а напрямую клиенту)
+                            ack_packet = PacketHandler.create_ack_packet(
+                                envelope.packet,
+                                our_node_num,
+                                envelope.packet.channel if envelope.packet.channel < 8 else 0
+                            )
+                            
+                            # Отправляем ACK напрямую клиенту (локально, не через MQTT)
+                            from_radio_ack = mesh_pb2.FromRadio()
+                            from_radio_ack.packet.CopyFrom(ack_packet)
+                            serialized_ack = from_radio_ack.SerializeToString()
+                            framed_ack = StreamAPI.add_framing(serialized_ack)
+                            to_client_queue.put(framed_ack)
+                            debug("ACK", f"Sent implicit ACK locally for own packet {envelope.packet.id} (gateway_id={envelope.gateway_id}, request_id={ack_packet.decoded.request_id})")
+                    except Exception as e:
+                        debug("ACK", f"Error sending implicit ACK for own packet: {e}")
+                    
+                    # Игнорируем собственный пакет (не обрабатываем дальше)
+                    debug("MQTT", f"Ignoring own packet (gateway_id={envelope.gateway_id}, packet.from={packet_from_envelope:08X}, implicit ACK sent locally)")
+                    return False
+                else:
+                    # Это не наш пакет, но gateway_id совпадает - игнорируем
+                    debug("MQTT", f"Ignoring downlink message we originally sent (gateway_id={envelope.gateway_id}, packet.from={packet_from_envelope:08X})")
+                    return False
+            
+            # Игнорируем только если это наш собственный пакет И он не адресован нам напрямую И это не ACK пакет
             # (если packet.to указывает на нас, это ответ от другого узла - обрабатываем)
-            if is_own_gateway and not is_for_us:
+            if is_own_gateway and not is_for_us and not is_ack_packet:
                 if envelope.channel_id == "Custom":
                     info("MQTT", f"🔍 Custom channel: ignoring own packet (gateway_id={envelope.gateway_id}, our node_id={self.node_id})")
                 else:
                     debug("MQTT", f"Ignoring own packet (gateway_id={envelope.gateway_id}, our node_id={self.node_id}, packet.from={envelope_from:08X}, packet.to={envelope_to:08X})")
                 return False
+            
+            # Логируем ACK пакеты для отладки
+            if is_ack_packet:
+                debug("ACK", f"Received ACK packet: gateway_id={envelope.gateway_id}, packet.from={envelope_from:08X}, packet.to={envelope_to:08X}, request_id={envelope.packet.decoded.request_id if hasattr(envelope.packet.decoded, 'request_id') else 'N/A'}")
             
             # Логируем получение пакета
             info("MQTT", f"Received packet from {envelope.gateway_id} on channel {envelope.channel_id}, packet.from={envelope_from:08X}, packet.to={envelope_to:08X}, our_node={our_node_num:08X}")
@@ -184,7 +248,7 @@ class MQTTPacketProcessor:
                             return False
                     else:
                         debug("PKI", f"Rejecting PKI message (from !{packet_from:08X} to !{packet_to:08X}) - not to us and no NodeDB")
-                        return False
+                    return False
                 payload_type = packet.WhichOneof('payload_variant')
             
             # Устанавливаем метаданные
@@ -615,6 +679,58 @@ class MQTTPacketProcessor:
                 info("PKI", f"Sent PKI packet to client: from=!{packet_from:08X}, to=!{envelope_to:08X}, payload_type={payload_type}, portnum={portnum_info}")
             else:
                 debug("MQTT", f"Sent packet to client: from=!{packet_from:08X}, to=!{envelope_to:08X}, payload_type={payload_type}, portnum={portnum_info}")
+            
+            # ВАЖНО: Отправляем ACK/NAK для пакетов с want_ack=true, полученных через MQTT
+            # (как в firmware ReliableRouter::sniffReceived - проверяет want_ack и отправляет ACK/NAK)
+            if payload_type == 'decoded' and packet.want_ack:
+                packet_to = packet.to
+                is_broadcast = (packet_to == 0xFFFFFFFF or packet_to == 0xFFFFFFFE)
+                is_to_us = (packet_to == our_node_num) if not is_broadcast else False
+                
+                # Проверяем, что это не ACK сам по себе (Routing сообщение с request_id)
+                is_routing_ack = (
+                    hasattr(packet.decoded, 'portnum') and 
+                    packet.decoded.portnum == portnums_pb2.PortNum.ROUTING_APP and
+                    hasattr(packet.decoded, 'request_id') and 
+                    packet.decoded.request_id != 0
+                )
+                
+                # Отправляем ACK только если:
+                # 1. Пакет адресован нам (не broadcast)
+                # 2. Это не ACK сам по себе
+                # 3. Это не Admin пакет (Admin пакеты обрабатываются отдельно)
+                is_admin = (hasattr(packet.decoded, 'portnum') and 
+                           packet.decoded.portnum == portnums_pb2.PortNum.ADMIN_APP)
+                
+                if not is_routing_ack and is_to_us and not is_admin:
+                    try:
+                        # Создаем ACK пакет (как в firmware MeshModule::allocAckNak)
+                        ack_packet = PacketHandler.create_ack_packet(
+                            packet, 
+                            our_node_num, 
+                            packet.channel if packet.channel < 8 else 0
+                        )
+                        
+                        # Находим сессию получателя (наша сессия) для отправки ACK через MQTT
+                        receiver_node_id = self.node_id if isinstance(self.node_id, str) else f"!{self.node_id:08X}"
+                        receiver_session = None
+                        if self.server:
+                            with self.server.sessions_lock:
+                                for session in self.server.active_sessions.values():
+                                    if session.node_id == receiver_node_id:
+                                        receiver_session = session
+                                        break
+                        
+                        if receiver_session and receiver_session.mqtt_client and receiver_session.mqtt_client.connected:
+                            channel_index = packet.channel if packet.channel < 8 else 0
+                            receiver_session.mqtt_client.publish_packet(ack_packet, channel_index)
+                            info("ACK", f"Sent ACK via MQTT for packet {packet.id} from !{packet_from:08X} to !{packet_to:08X} (request_id={ack_packet.decoded.request_id})")
+                        else:
+                            debug("ACK", f"Could not send ACK via MQTT: receiver_session not found or MQTT not connected")
+                    except Exception as e:
+                        error("ACK", f"Error sending ACK via MQTT: {e}")
+                        import traceback
+                        traceback.print_exc()
             
             return True
         except Exception as e:
