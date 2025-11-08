@@ -45,6 +45,8 @@ class MQTTClient:
         
         # Флаг для предотвращения повторной остановки
         self._stopped = False
+        # Флаг ошибки авторизации (сохраняется между пересозданиями connection)
+        self._auth_failed = False
     
     def update_config(self, mqtt_config):
         """
