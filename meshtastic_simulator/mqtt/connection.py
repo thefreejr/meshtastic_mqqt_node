@@ -118,6 +118,9 @@ class MQTTConnection:
                 time.sleep(0.1)
                 if self.connected:
                     return True
+                # Если флаг ошибки авторизации установился (в callback), сразу выходим
+                if self._auth_failed:
+                    break
                 # Если произошла ошибка подключения, выходим
                 if not self.client._thread or not self.client._thread.is_alive():
                     break
@@ -125,7 +128,9 @@ class MQTTConnection:
             if not self.connected:
                 # Проверяем, есть ли информация об ошибке в клиенте
                 # (ошибка авторизации уже обработана в _on_connect callback)
-                pass
+                if self._auth_failed:
+                    # Флаг уже установлен в callback, просто возвращаем False
+                    return False
             return self.connected
         except Exception as e:
             error("MQTT", f"Connection error: {e}")

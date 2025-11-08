@@ -47,6 +47,8 @@ class MQTTClient:
         self._stopped = False
         # Флаг ошибки авторизации (сохраняется между пересозданиями connection)
         self._auth_failed = False
+        # Флаг для предотвращения повторных попыток подключения
+        self._connecting = False
     
     def update_config(self, mqtt_config):
         """
@@ -122,16 +124,8 @@ class MQTTClient:
                 self.password = DEFAULT_MQTT_PASSWORD
                 debug("MQTT", f"Password not set, using default (length: {len(DEFAULT_MQTT_PASSWORD) if DEFAULT_MQTT_PASSWORD else 0})")
             
-            # ВАЖНО: Если настройки изменились (username или password), сбрасываем флаг ошибки авторизации
-            # и разрешаем переподключение с новыми учетными данными
-            if (old_username != self.username or old_password != self.password or 
-                old_broker != self.broker or old_port != self.port):
-                # Сбрасываем флаг в MQTTClient (сохраняется между пересозданиями connection)
-                self._auth_failed = False
-                if self.connection and hasattr(self.connection, '_auth_failed'):
-                    self.connection._auth_failed = False
-                    self.connection._reconnect_stop = False
-                    info("MQTT", "MQTT settings changed, resetting auth failure flag and enabling reconnection")
+            # ВАЖНО: Сброс флага ошибки авторизации при изменении настроек выполняется ниже,
+            # в блоке if settings_changed, чтобы избежать дублирования кода
             
             # Обновляем корневой топик (как в firmware)
             if hasattr(mqtt_config, 'root') and mqtt_config.root:
@@ -157,8 +151,17 @@ class MQTTClient:
             
             # Обновляем модули с новыми настройками
             if settings_changed:
+                # Сбрасываем флаг ошибки авторизации при изменении настроек
+                # (пользователь мог исправить учетные данные)
+                if self._auth_failed:
+                    self._auth_failed = False
+                    if self.connection and hasattr(self.connection, '_auth_failed'):
+                        self.connection._auth_failed = False
+                        self.connection._reconnect_stop = False
+                        info("MQTT", f"[{self.node_id}] MQTT settings changed, resetting auth failure flag and enabling reconnection")
+                
                 if self.connection and self.connection.is_connected():
-                    info("MQTT", "Reconnecting with new settings...")
+                    info("MQTT", f"[{self.node_id}] Reconnecting with new settings...")
                     self.stop()
                     time.sleep(1)
                 # Если не подключен, просто запускаем с новыми настройками
@@ -176,43 +179,67 @@ class MQTTClient:
     
     def start(self):
         """Запускает MQTT клиент"""
-        # Создаем callback для подписки
-        def on_connect_callback(client, userdata, flags, rc, properties=None, reasonCode=None):
-            if rc == 0:
-                # Сообщение о подключении уже выводится в MQTTConnection._on_connect
-                # Сбрасываем флаг ошибки авторизации при успешном подключении
-                self._auth_failed = False
-                # Подписываемся на каналы
-                self.subscription.subscribe_to_channels(client)
-        
-        # Создаем callback для обработки сообщений
-        def on_message_callback(client, userdata, msg):
-            self.packet_processor.process_mqtt_message(msg, self.to_client_queue)
-        
-        # Создаем callback для обновления флага ошибки авторизации
-        def on_auth_failed_callback():
-            self._auth_failed = True
-        
-        # Создаем подключение
-        self.connection = MQTTConnection(
-            broker=self.broker,
-            port=self.port,
-            username=self.username,
-            password=self.password,
-            node_id=self.node_id,
-            on_connect_callback=on_connect_callback,
-            on_message_callback=on_message_callback
-        )
-        
-        # Устанавливаем callback для обновления флага ошибки авторизации
-        self.connection._auth_failed_callback = on_auth_failed_callback
+        # Если уже идет подключение, не запускаем повторно
+        if self._connecting:
+            debug("MQTT", f"[{self.node_id}] Connection attempt already in progress, skipping")
+            return False
         
         # Восстанавливаем флаг ошибки авторизации из предыдущего подключения
         if self._auth_failed:
-            self.connection._auth_failed = True
-            self.connection._reconnect_stop = True
+            warn("MQTT", f"[{self.node_id}] Skipping connection attempt: authentication failed previously. Please update MQTT settings via AdminMessage.")
+            return False
         
-        return self.connection.connect()
+        # Устанавливаем флаг подключения
+        self._connecting = True
+        
+        try:
+            # Создаем callback для подписки
+            def on_connect_callback(client, userdata, flags, rc, properties=None, reasonCode=None):
+                if rc == 0:
+                    # Сообщение о подключении уже выводится в MQTTConnection._on_connect
+                    # Сбрасываем флаг ошибки авторизации при успешном подключении
+                    self._auth_failed = False
+                    self._connecting = False
+                    # Подписываемся на каналы
+                    self.subscription.subscribe_to_channels(client)
+                else:
+                    # При ошибке подключения сбрасываем флаг подключения
+                    self._connecting = False
+            
+            # Создаем callback для обработки сообщений
+            def on_message_callback(client, userdata, msg):
+                self.packet_processor.process_mqtt_message(msg, self.to_client_queue)
+            
+            # Создаем callback для обновления флага ошибки авторизации
+            def on_auth_failed_callback():
+                self._auth_failed = True
+                self._connecting = False
+            
+            # Создаем подключение
+            self.connection = MQTTConnection(
+                broker=self.broker,
+                port=self.port,
+                username=self.username,
+                password=self.password,
+                node_id=self.node_id,
+                on_connect_callback=on_connect_callback,
+                on_message_callback=on_message_callback
+            )
+            
+            # Устанавливаем callback для обновления флага ошибки авторизации
+            self.connection._auth_failed_callback = on_auth_failed_callback
+            
+            result = self.connection.connect()
+            
+            # Если подключение не удалось, сбрасываем флаг подключения
+            if not result:
+                self._connecting = False
+            
+            return result
+        except Exception as e:
+            error("MQTT", f"[{self.node_id}] Error in start(): {e}")
+            self._connecting = False
+            return False
     
     @property
     def connected(self):
