@@ -54,6 +54,7 @@ class MQTTConnection:
         self._reconnect_lock = threading.Lock()
         self._auth_failed = False  # Флаг ошибки авторизации (останавливает переподключение)
         self._auth_failed_callback = None  # Callback для обновления флага в родительском объекте
+        self._connected_lock = threading.Lock()  # Блокировка для синхронизации доступа к self.connected
     
     def connect(self) -> bool:
         """
@@ -80,7 +81,9 @@ class MQTTConnection:
                     self.client = mqtt.Client(client_id=self.node_id)
             else:
                 self.client = mqtt.Client(client_id=self.node_id)
-        except:
+        except Exception as e:
+            # Если не удалось создать клиент с CallbackAPIVersion, используем базовый вариант
+            debug("MQTT", f"Failed to create client with CallbackAPIVersion, using basic client: {e}")
             self.client = mqtt.Client(client_id=self.node_id)
         
         # Устанавливаем учетные данные
@@ -111,27 +114,42 @@ class MQTTConnection:
         keepalive = 60
         
         try:
+            # ВАЖНО: Проверяем флаг еще раз перед вызовом client.connect(),
+            # так как он может измениться в другом потоке
+            if self._auth_failed:
+                debug("MQTT", "Skipping client.connect(): authentication failed. Please update MQTT settings via AdminMessage.")
+                return False
+            
             self.client.connect(self.broker, self.port, keepalive)
             self.client.loop_start()
             # Ждем подключения или ошибки (максимум 3 секунды)
             for _ in range(30):  # 30 * 0.1 = 3 секунды
                 time.sleep(0.1)
-                if self.connected:
-                    return True
+                with self._connected_lock:
+                    if self.connected:
+                        return True
                 # Если флаг ошибки авторизации установился (в callback), сразу выходим
                 if self._auth_failed:
                     break
                 # Если произошла ошибка подключения, выходим
-                if not self.client._thread or not self.client._thread.is_alive():
-                    break
+                # ВАЖНО: Проверяем наличие client перед доступом к _thread (приватный атрибут)
+                if self.client and hasattr(self.client, '_thread'):
+                    try:
+                        if not self.client._thread or not self.client._thread.is_alive():
+                            break
+                    except (AttributeError, Exception):
+                        # Если _thread недоступен, продолжаем ожидание
+                        pass
             # Если подключение не удалось, проверяем, не была ли это ошибка авторизации
-            if not self.connected:
-                # Проверяем, есть ли информация об ошибке в клиенте
-                # (ошибка авторизации уже обработана в _on_connect callback)
-                if self._auth_failed:
-                    # Флаг уже установлен в callback, просто возвращаем False
+            with self._connected_lock:
+                if not self.connected:
+                    # Проверяем, есть ли информация об ошибке в клиенте
+                    # (ошибка авторизации уже обработана в _on_connect callback)
+                    if self._auth_failed:
+                        # Флаг уже установлен в callback, просто возвращаем False
+                        return False
                     return False
-            return self.connected
+                return True
         except Exception as e:
             error("MQTT", f"Connection error: {e}")
             if self.client:
@@ -156,7 +174,8 @@ class MQTTConnection:
         
         # Проверяем успешное подключение (0 = успех)
         if result_code == 0 or (isinstance(result_code, int) and result_code == 0):
-            self.connected = True
+            with self._connected_lock:
+                self.connected = True
             # Останавливаем автоматическое переподключение, так как мы подключены
             self._reconnect_stop = True
             # Сбрасываем флаг ошибки авторизации при успешном подключении
@@ -170,7 +189,8 @@ class MQTTConnection:
             # Детальное логирование ошибок
             error_msg = self._get_error_message(result_code)
             error("MQTT", f"Connection error: {error_msg} (code: {result_code})")
-            self.connected = False
+            with self._connected_lock:
+                self.connected = False
             
             # Если ошибка "Not authorized" (код 5 или 135), останавливаем переподключение
             # Пользователь должен изменить настройки MQTT через AdminMessage
@@ -183,8 +203,16 @@ class MQTTConnection:
                 is_auth_error = True
             
             if is_auth_error:
+                # ВАЖНО: Устанавливаем флаг СИНХРОННО, ДО того как может быть вызван _on_disconnect
+                # Это предотвращает запуск auto-reconnect в _on_disconnect
                 self._auth_failed = True
                 self._reconnect_stop = True
+                # Останавливаем loop сразу, чтобы предотвратить дальнейшие вызовы
+                if self.client:
+                    try:
+                        self.client.loop_stop()
+                    except Exception as e:
+                        debug("MQTT", f"Error stopping loop on auth failure: {e}")
                 # Обновляем флаг в родительском объекте (если есть callback)
                 if self._auth_failed_callback:
                     self._auth_failed_callback()
@@ -213,7 +241,8 @@ class MQTTConnection:
             return
         
         # Только если это реальное отключение, устанавливаем флаг
-        self.connected = False
+        with self._connected_lock:
+            self.connected = False
         
         # В MQTT v5 может быть reasonCode в properties или как отдельный параметр
         # Если properties - это объект с reasonCode, извлекаем его
@@ -293,9 +322,10 @@ class MQTTConnection:
             return
         
         while not self._reconnect_stop and not self._auth_failed:
-            if self.connected:
-                # Уже подключены - выходим
-                break
+            with self._connected_lock:
+                if self.connected:
+                    # Уже подключены - выходим
+                    break
             
             # Проверяем флаг перед каждой попыткой (может измениться во время ожидания)
             if self._auth_failed:
@@ -423,33 +453,45 @@ class MQTTConnection:
         """Отключается от MQTT брокера"""
         # Останавливаем автоматическое переподключение
         self._reconnect_stop = True
+        
+        # Ожидаем завершения потока переподключения с увеличенным timeout
+        # и проверкой, что поток действительно daemon (должен завершиться автоматически)
         if self._reconnect_thread and self._reconnect_thread.is_alive():
-            self._reconnect_thread.join(timeout=2)
+            # Увеличиваем timeout до 5 секунд для корректного завершения
+            self._reconnect_thread.join(timeout=5)
+            if self._reconnect_thread.is_alive():
+                warn("MQTT", "Reconnect thread did not finish in time, but it's daemon so will be terminated")
         
         if self.client:
             try:
                 # Останавливаем loop перед disconnect для корректного завершения
                 try:
-                    if hasattr(self.client, '_thread') and self.client._thread and self.client._thread.is_alive():
-                        self.client.loop_stop()
-                        # Даем время на завершение потока
-                        time.sleep(0.2)
-                except:
-                    pass
+                    if self.client and hasattr(self.client, '_thread'):
+                        try:
+                            if self.client._thread and self.client._thread.is_alive():
+                                self.client.loop_stop()
+                                # Даем время на завершение потока
+                                time.sleep(0.2)
+                        except Exception as e:
+                            debug("MQTT", f"Error stopping client loop: {e}")
+                except Exception as e:
+                    debug("MQTT", f"Error accessing client thread: {e}")
                 # Отключаемся от брокера
                 try:
                     self.client.disconnect()
-                except:
-                    pass
+                except Exception as e:
+                    debug("MQTT", f"Error during client.disconnect(): {e}")
             except Exception as e:
-                # Игнорируем ошибки при отключении
-                pass
+                # Логируем ошибки при отключении для отладки
+                debug("MQTT", f"Error during disconnect: {e}")
             finally:
-                self.connected = False
+                with self._connected_lock:
+                    self.connected = False
     
     def is_connected(self) -> bool:
         """Проверяет, подключен ли клиент"""
-        return self.connected
+        with self._connected_lock:
+            return self.connected
     
     def reconnect(self) -> bool:
         """
@@ -463,31 +505,41 @@ class MQTTConnection:
             debug("MQTT", "Skipping reconnect: authentication failed. Please update MQTT settings via AdminMessage.")
             return False
         
-        # Останавливаем текущее соединение, но не останавливаем автоматическое переподключение
-        old_reconnect_stop = self._reconnect_stop
-        self._reconnect_stop = True  # Временно останавливаем, чтобы не создавать дубликаты
-        
-        if self.client:
-            try:
-                # Останавливаем loop перед disconnect
+        # ВАЖНО: Используем блокировку для атомарности операций с _reconnect_stop
+        # Это предотвращает race condition, когда _on_disconnect может запустить новый auto-reconnect
+        # между установкой _reconnect_stop и вызовом disconnect()
+        with self._reconnect_lock:
+            # Останавливаем текущее соединение, но не останавливаем автоматическое переподключение
+            old_reconnect_stop = self._reconnect_stop
+            self._reconnect_stop = True  # Временно останавливаем, чтобы не создавать дубликаты
+            
+            if self.client:
                 try:
-                    if hasattr(self.client, '_thread') and self.client._thread and self.client._thread.is_alive():
-                        self.client.loop_stop()
-                        time.sleep(0.2)
-                except:
-                    pass
-                # Отключаемся от брокера
-                try:
-                    self.client.disconnect()
-                except:
-                    pass
-            except Exception as e:
-                debug("MQTT", f"Error during disconnect before reconnect: {e}")
-            finally:
-                self.connected = False
-        
-        # Восстанавливаем флаг автоматического переподключения
-        self._reconnect_stop = old_reconnect_stop
+                    # Останавливаем loop перед disconnect
+                    try:
+                        if self.client and hasattr(self.client, '_thread'):
+                            try:
+                                if self.client._thread and self.client._thread.is_alive():
+                                    self.client.loop_stop()
+                                    time.sleep(0.2)
+                            except Exception as e:
+                                debug("MQTT", f"Error stopping client loop in reconnect: {e}")
+                    except Exception as e:
+                        debug("MQTT", f"Error accessing client thread in reconnect: {e}")
+                    # Отключаемся от брокера
+                    try:
+                        self.client.disconnect()
+                    except Exception as e:
+                        debug("MQTT", f"Error during client.disconnect() in reconnect: {e}")
+                except Exception as e:
+                    debug("MQTT", f"Error during disconnect before reconnect: {e}")
+                finally:
+                    with self._connected_lock:
+                        self.connected = False
+            
+            # Восстанавливаем флаг автоматического переподключения внутри блокировки
+            # (чтобы _on_disconnect не мог запустить auto-reconnect между disconnect и восстановлением флага)
+            self._reconnect_stop = old_reconnect_stop
         
         # Ждем перед переподключением
         time.sleep(1)

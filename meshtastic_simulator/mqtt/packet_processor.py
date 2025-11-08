@@ -5,6 +5,7 @@
 import random
 import struct
 import time
+import queue
 from typing import Optional, Tuple, Any
 
 try:
@@ -157,7 +158,11 @@ class MQTTPacketProcessor:
                             from_radio_ack.packet.CopyFrom(ack_packet)
                             serialized_ack = from_radio_ack.SerializeToString()
                             framed_ack = StreamAPI.add_framing(serialized_ack)
-                            to_client_queue.put(framed_ack)
+                            # Используем put_nowait для избежания блокировки
+                            try:
+                                to_client_queue.put_nowait(framed_ack)
+                            except queue.Full:
+                                warn("MQTT", f"Client queue is full, dropping ACK packet")
                             debug("ACK", f"Sent implicit ACK locally for own packet {envelope.packet.id} (gateway_id={envelope.gateway_id}, request_id={ack_packet.decoded.request_id})")
                     except Exception as e:
                         debug("ACK", f"Error sending implicit ACK for own packet: {e}")
@@ -278,8 +283,8 @@ class MQTTPacketProcessor:
             if hasattr(packet, 'transport_mechanism'):
                 try:
                     packet.transport_mechanism = mesh_pb2.MeshPacket.TransportMechanism.TRANSPORT_MQTT
-                except:
-                    pass
+                except Exception as e:
+                    debug("MQTT", f"Error setting transport_mechanism: {e}")
             
             # Устанавливаем rx_time
             if hasattr(packet, 'rx_time'):
@@ -599,7 +604,11 @@ class MQTTPacketProcessor:
                             debug("MQTT", f"Error checking serialized FromRadio: {e}")
                         
                         framed_node_info = StreamAPI.add_framing(serialized_node_info)
-                        to_client_queue.put(framed_node_info)
+                        # Используем put_nowait для избежания блокировки
+                        try:
+                            to_client_queue.put_nowait(framed_node_info)
+                        except queue.Full:
+                            warn("MQTT", f"Client queue is full, dropping NodeInfo packet")
                         short_name = node_info.user.short_name if hasattr(node_info.user, 'short_name') and node_info.user.short_name else 'N/A'
                         debug("MQTT", f"Sent NodeInfo to client for node !{packet_from:08X} ({short_name}, telemetry={has_telemetry_after}, battery={battery if has_telemetry_after else 'N/A'})")
                         
@@ -633,7 +642,11 @@ class MQTTPacketProcessor:
                                     # Отправляем клиенту
                                     serialized_telemetry = from_radio_telemetry.SerializeToString()
                                     framed_telemetry = StreamAPI.add_framing(serialized_telemetry)
-                                    to_client_queue.put(framed_telemetry)
+                                    # Используем put_nowait для избежания блокировки
+                                    try:
+                                        to_client_queue.put_nowait(framed_telemetry)
+                                    except queue.Full:
+                                        warn("MQTT", f"Client queue is full, dropping Telemetry packet")
                                     debug("MQTT", f"Sent TELEMETRY_APP packet to client for node !{packet_from:08X} (battery={node_info.device_metrics.battery_level})")
                             except Exception as e:
                                 debug("MQTT", f"Error sending TELEMETRY_APP packet: {e}")
@@ -690,12 +703,22 @@ class MQTTPacketProcessor:
             # Отправляем пакет клиенту (как в firmware MeshService::sendToPhone)
             # В firmware все пакеты отправляются клиенту, независимо от того, от кого они пришли
             # ВАЖНО: Для PKI канала пакеты отправляются даже если не расшифрованы (как в firmware MQTT.cpp:117-123)
+            # ВАЖНО: Проверяем, что очередь не переполнена (предотвращает утечку памяти)
+            try:
             from_radio = mesh_pb2.FromRadio()
             from_radio.packet.CopyFrom(packet)
             
             serialized = from_radio.SerializeToString()
             framed = StreamAPI.add_framing(serialized)
-            to_client_queue.put(framed)
+                # Используем put_nowait для избежания блокировки, если очередь переполнена
+                try:
+                    to_client_queue.put_nowait(framed)
+                except queue.Full:
+                    # Если очередь переполнена, логируем предупреждение и пропускаем пакет
+                    # (лучше потерять пакет, чем накапливать их в памяти)
+                    warn("MQTT", f"Client queue is full, dropping packet from !{packet_from:08X}")
+            except Exception as e:
+                error("MQTT", f"Error preparing packet for client: {e}")
             
             # Логируем отправку пакета клиенту
             payload_type = packet.WhichOneof('payload_variant')
