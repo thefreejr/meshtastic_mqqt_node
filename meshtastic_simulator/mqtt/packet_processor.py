@@ -149,10 +149,42 @@ class MQTTPacketProcessor:
             
             # Расшифровываем пакет если нужно
             payload_type = packet.WhichOneof('payload_variant')
+            is_pki_channel = envelope.channel_id == "PKI"
             if payload_type == 'encrypted':
                 decrypted = self.decrypt_packet(packet, ch, envelope.channel_id)
-                if not decrypted:
+                # ВАЖНО: Для PKI канала пакеты принимаются даже если не расшифрованы
+                # (как в firmware MQTT.cpp:117-123 - PKI messages get accepted even if we can't decrypt)
+                if not decrypted and not is_pki_channel:
                     return False
+                # Для PKI канала проверяем условия приема (как в firmware)
+                if not decrypted and is_pki_channel:
+                    packet_from = getattr(packet, 'from', 0)
+                    packet_to = packet.to
+                    is_broadcast = packet_to == 0xFFFFFFFF or packet_to == 0xFFFFFFFE
+                    is_to_us = packet_to == our_node_num if not is_broadcast else False
+                    
+                    # Принимаем PKI сообщения если:
+                    # 1. Адресованы нам (isToUs)
+                    # 2. ИЛИ у нас есть информация об отправителе и получателе в NodeDB (tx && tx->has_user && rx && rx->has_user)
+                    if is_to_us:
+                        info("PKI", f"Accepting PKI message to us (from !{packet_from:08X} to !{packet_to:08X}) even though not decrypted")
+                    elif self.node_db:
+                        from_node = self.node_db.get_mesh_node(packet_from)
+                        to_node = self.node_db.get_mesh_node(packet_to) if not is_broadcast else None
+                        from_has_user = (from_node and hasattr(from_node, 'user') and 
+                                        ((hasattr(from_node.user, 'short_name') and from_node.user.short_name) or
+                                         (hasattr(from_node.user, 'long_name') and from_node.user.long_name)))
+                        to_has_user = (to_node and hasattr(to_node, 'user') and 
+                                      ((hasattr(to_node.user, 'short_name') and to_node.user.short_name) or
+                                       (hasattr(to_node.user, 'long_name') and to_node.user.long_name)))
+                        if from_has_user and (is_broadcast or to_has_user):
+                            info("PKI", f"Accepting PKI message (from !{packet_from:08X} to !{packet_to:08X}) even though not decrypted - both nodes have user info")
+                        else:
+                            debug("PKI", f"Rejecting PKI message (from !{packet_from:08X} to !{packet_to:08X}) - missing user info (from_has_user={from_has_user}, to_has_user={to_has_user if not is_broadcast else 'N/A'})")
+                            return False
+                    else:
+                        debug("PKI", f"Rejecting PKI message (from !{packet_from:08X} to !{packet_to:08X}) - not to us and no NodeDB")
+                        return False
                 payload_type = packet.WhichOneof('payload_variant')
             
             # Устанавливаем метаданные
@@ -563,6 +595,7 @@ class MQTTPacketProcessor:
             
             # Отправляем пакет клиенту (как в firmware MeshService::sendToPhone)
             # В firmware все пакеты отправляются клиенту, независимо от того, от кого они пришли
+            # ВАЖНО: Для PKI канала пакеты отправляются даже если не расшифрованы (как в firmware MQTT.cpp:117-123)
             from_radio = mesh_pb2.FromRadio()
             from_radio.packet.CopyFrom(packet)
             
@@ -570,7 +603,18 @@ class MQTTPacketProcessor:
             framed = StreamAPI.add_framing(serialized)
             to_client_queue.put(framed)
             
-            debug("MQTT", f"Sent packet to client: from=!{packet_from:08X}, to=!{envelope_to:08X}, portnum={packet.decoded.portnum if packet.WhichOneof('payload_variant') == 'decoded' and hasattr(packet.decoded, 'portnum') else 'N/A'}")
+            # Логируем отправку пакета клиенту
+            payload_type = packet.WhichOneof('payload_variant')
+            portnum_info = 'N/A'
+            if payload_type == 'decoded' and hasattr(packet.decoded, 'portnum'):
+                portnum_info = packet.decoded.portnum
+            elif payload_type == 'encrypted':
+                portnum_info = 'encrypted'
+            
+            if is_pki_channel:
+                info("PKI", f"Sent PKI packet to client: from=!{packet_from:08X}, to=!{envelope_to:08X}, payload_type={payload_type}, portnum={portnum_info}")
+            else:
+                debug("MQTT", f"Sent packet to client: from=!{packet_from:08X}, to=!{envelope_to:08X}, payload_type={payload_type}, portnum={portnum_info}")
             
             return True
         except Exception as e:

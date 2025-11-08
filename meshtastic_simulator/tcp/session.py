@@ -110,6 +110,9 @@ class TCPConnectionSession:
         
         # Флаг для предотвращения повторного закрытия
         self._closed = False
+        
+        # Throttling для публикации NodeInfo (как в firmware NodeInfoModule - не чаще чем раз в 5 минут)
+        self.last_nodeinfo_published = 0  # Время последней публикации NodeInfo в MQTT
     
     def _init_telemetry(self) -> None:
         """Инициализирует телеметрию в NodeDB для этой сессии"""
@@ -249,6 +252,15 @@ class TCPConnectionSession:
         if not self.mqtt_client or not self.mqtt_client.connected:
             return
         
+        # Throttling: не публикуем NodeInfo чаще чем раз в 5 минут (как в firmware NodeInfoModule)
+        # Это предотвращает частую публикацию публичного ключа
+        current_time = time.time()
+        if hasattr(self, 'last_nodeinfo_published') and self.last_nodeinfo_published > 0:
+            time_since_last = current_time - self.last_nodeinfo_published
+            if time_since_last < 5 * 60:  # 5 минут
+                debug("MQTT", f"[{self._log_prefix()}] Skipping NodeInfo publish (sent {time_since_last:.1f}s ago, <5min)")
+                return
+        
         try:
             import random
             from ..config import DEFAULT_HOP_LIMIT
@@ -297,6 +309,7 @@ class TCPConnectionSession:
             
             # Отправляем в MQTT
             self.mqtt_client.publish_packet(packet, 0)
+            self.last_nodeinfo_published = current_time  # Обновляем время последней публикации
             info("MQTT", f"[{self._log_prefix()}] Published NodeInfo to MQTT: {self.owner.short_name}/{self.owner.long_name}")
         except Exception as e:
             error("MQTT", f"[{self._log_prefix()}] Error publishing NodeInfo to MQTT: {e}")
