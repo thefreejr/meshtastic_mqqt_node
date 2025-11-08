@@ -106,16 +106,30 @@ class NodeDB:
             error("NODE", f"Ошибка обновления позиции: {e}")
     
     def update_user(self, node_num: int, user: mesh_pb2.User, channel: int) -> bool:
-        """Обновляет информацию о пользователе узла"""
+        """Обновляет информацию о пользователе узла (как в firmware NodeDB::updateUser)"""
         node_info = self.get_or_create_mesh_node(node_num)
         
+        # ВАЖНО: Логика обработки публичного ключа (как в firmware NodeDB.cpp:1690-1699)
+        # Если у узла уже есть публичный ключ, проверяем совпадение
+        # Если ключ не совпадает, отклоняем обновление (как в firmware)
+        existing_public_key = None
+        if hasattr(node_info.user, 'public_key') and len(node_info.user.public_key) == 32:
+            existing_public_key = node_info.user.public_key
+        
         if hasattr(user, 'public_key') and len(user.public_key) == 32:
-            if not hasattr(node_info.user, 'public_key') or len(node_info.user.public_key) != 32:
-                node_info.user.public_key = user.public_key
-                debug("NODE", f"Сохранен public_key для узла !{node_num:08X}")
-            elif node_info.user.public_key != user.public_key:
-                warn("NODE", f"Public Key mismatch для узла !{node_num:08X}, пропускаем обновление")
-                return False
+            if existing_public_key:
+                # У узла уже есть ключ - проверяем совпадение (как в firmware: "if the key doesn't match, don't update nodeDB at all")
+                if existing_public_key != user.public_key:
+                    warn("NODE", f"Public Key mismatch для узла !{node_num:08X}, пропускаем обновление (как в firmware)")
+                    return False
+                else:
+                    debug("NODE", f"Public Key set for node !{node_num:08X}, not updating (как в firmware)")
+            else:
+                # У узла нет ключа - сохраняем новый (как в firmware: "Update Node Pubkey!")
+                info("NODE", f"Update Node Pubkey для !{node_num:08X}!")
+        
+        # Сохраняем существующий публичный ключ перед CopyFrom (чтобы не потерять его)
+        saved_public_key = existing_public_key if existing_public_key else None
         
         user.id = f"!{node_num:08X}"
         changed = (
@@ -125,7 +139,19 @@ class NodeDB:
             node_info.user.hw_model != user.hw_model
         )
         
+        # Копируем User (как в firmware: info->user = lite)
         node_info.user.CopyFrom(user)
+        
+        # ВАЖНО: Восстанавливаем существующий публичный ключ, если он был сохранен
+        # (CopyFrom может перезаписать его, если в user.public_key нет ключа)
+        if saved_public_key:
+            node_info.user.public_key = saved_public_key
+            debug("NODE", f"Восстановлен существующий public_key для узла !{node_num:08X} после CopyFrom")
+        elif hasattr(user, 'public_key') and len(user.public_key) == 32:
+            # Если в user есть новый ключ и у узла его не было, сохраняем его
+            node_info.user.public_key = user.public_key
+            debug("NODE", f"Сохранен новый public_key для узла !{node_num:08X}")
+        
         node_info.channel = channel
         
         if changed:

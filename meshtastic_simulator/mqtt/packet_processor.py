@@ -227,13 +227,34 @@ class MQTTPacketProcessor:
                     is_broadcast = packet_to == 0xFFFFFFFF or packet_to == 0xFFFFFFFE
                     is_to_us = packet_to == our_node_num if not is_broadcast else False
                     
+                    # ВАЖНО: Проверяем наличие публичного ключа у отправителя (как в firmware ReliableRouter.cpp:122-126)
+                    # Если у отправителя нет публичного ключа, отправляем NodeInfo с публичным ключом
+                    from_node = self.node_db.get_mesh_node(packet_from) if self.node_db else None
+                    from_has_public_key = (from_node and hasattr(from_node.user, 'public_key') and 
+                                          len(from_node.user.public_key) == 32)
+                    
+                    if not from_has_public_key and is_to_us and packet.want_ack:
+                        # У отправителя нет публичного ключа, и пакет адресован нам с want_ack
+                        # Отправляем NodeInfo с публичным ключом (как в firmware: "PKI packet from unknown node, send PKI_UNKNOWN_PUBKEY")
+                        info("PKI", f"PKI packet from !{packet_from:08X} without public key, sending NodeInfo with public key (as in firmware)")
+                        # Находим сессию получателя для отправки NodeInfo
+                        receiver_node_id = self.node_id if isinstance(self.node_id, str) else f"!{self.node_id:08X}"
+                        receiver_session = None
+                        if self.server:
+                            with self.server.sessions_lock:
+                                for session in self.server.active_sessions.values():
+                                    if session.node_id == receiver_node_id:
+                                        receiver_session = session
+                                        break
+                        if receiver_session:
+                            self._send_receiver_nodeinfo_to_sender(receiver_session, packet_from, packet.channel)
+                    
                     # Принимаем PKI сообщения если:
                     # 1. Адресованы нам (isToUs)
                     # 2. ИЛИ у нас есть информация об отправителе и получателе в NodeDB (tx && tx->has_user && rx && rx->has_user)
                     if is_to_us:
                         info("PKI", f"Accepting PKI message to us (from !{packet_from:08X} to !{packet_to:08X}) even though not decrypted")
                     elif self.node_db:
-                        from_node = self.node_db.get_mesh_node(packet_from)
                         to_node = self.node_db.get_mesh_node(packet_to) if not is_broadcast else None
                         from_has_user = (from_node and hasattr(from_node, 'user') and 
                                         ((hasattr(from_node.user, 'short_name') and from_node.user.short_name) or
@@ -248,7 +269,7 @@ class MQTTPacketProcessor:
                             return False
                     else:
                         debug("PKI", f"Rejecting PKI message (from !{packet_from:08X} to !{packet_to:08X}) - not to us and no NodeDB")
-                    return False
+                        return False
                 payload_type = packet.WhichOneof('payload_variant')
             
             # Устанавливаем метаданные
