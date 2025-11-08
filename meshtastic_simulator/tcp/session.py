@@ -815,13 +815,18 @@ class TCPConnectionSession:
             channel_index = packet.channel if packet.channel < MAX_NUM_CHANNELS else 0
             
             # Обработка пакетов позиции от клиента (как в firmware PositionModule::handleReceivedProtobuf)
+            # Android клиент отправляет позицию из GPS через POSITION_APP пакет
             if hasattr(packet.decoded, 'portnum') and packet.decoded.portnum == portnums_pb2.PortNum.POSITION_APP:
                 try:
                     position = mesh_pb2.Position()
                     position.ParseFromString(packet.decoded.payload)
                     # Обновляем позицию в NodeDB (как в firmware nodeDB->updatePosition)
-                    self.node_db.update_position(self.node_num, position)
-                    debug("POSITION", f"[{self._log_prefix()}] Updated position from client: lat={position.latitude_i}, lon={position.longitude_i}")
+                    # Если fixed_position не установлен, обновляем позицию (как в Android: if (!localConfig.position.fixedPosition))
+                    if not self.config_storage.config.position.fixed_position:
+                        self.node_db.update_position(self.node_num, position)
+                        debug("POSITION", f"[{self._log_prefix()}] Updated position from client GPS: lat={position.latitude_i}, lon={position.longitude_i}")
+                    else:
+                        debug("POSITION", f"[{self._log_prefix()}] Ignoring position update from client (fixed_position is enabled)")
                 except Exception as e:
                     debug("POSITION", f"[{self._log_prefix()}] Error parsing position from client: {e}")
             
@@ -983,6 +988,45 @@ class TCPConnectionSession:
                 self.config_storage.set_config(admin_msg.set_config)
                 self.persistence.save_config(self.config_storage.config)
                 debug("ADMIN", f"[{self._log_prefix()}] Configuration saved to ConfigStorage")
+            
+            elif admin_msg.HasField('set_fixed_position'):
+                # Устанавливаем фиксированную позицию (как в firmware AdminModule::set_fixed_position)
+                fixed_position = admin_msg.set_fixed_position
+                info("ADMIN", f"[{self._log_prefix()}] Setting fixed position: lat={fixed_position.latitude_i}, lon={fixed_position.longitude_i}")
+                
+                # Обновляем позицию в NodeDB
+                our_node = self.node_db.get_or_create_mesh_node(self.node_num)
+                if not hasattr(our_node, 'position'):
+                    our_node.position = mesh_pb2.Position()
+                our_node.position.CopyFrom(fixed_position)
+                our_node.has_position = True
+                
+                # Обновляем позицию через update_position для правильной обработки
+                self.node_db.update_position(self.node_num, fixed_position)
+                
+                # Устанавливаем флаг fixed_position в конфигурации
+                self.config_storage.config.position.fixed_position = True
+                self.persistence.save_config(self.config_storage.config)
+                
+                # Отправляем позицию в mesh (как в firmware positionModule->sendOurPosition())
+                if self.mqtt_client and self.mqtt_client.connected:
+                    self._send_our_position()
+                    info("ADMIN", f"[{self._log_prefix()}] Fixed position set and sent to mesh")
+            
+            elif admin_msg.HasField('remove_fixed_position'):
+                # Удаляем фиксированную позицию (как в firmware AdminModule::remove_fixed_position)
+                info("ADMIN", f"[{self._log_prefix()}] Removing fixed position")
+                
+                # Очищаем позицию в NodeDB
+                our_node = self.node_db.get_or_create_mesh_node(self.node_num)
+                if hasattr(our_node, 'position'):
+                    our_node.position = mesh_pb2.Position()
+                    our_node.has_position = False
+                
+                # Убираем флаг fixed_position в конфигурации
+                self.config_storage.config.position.fixed_position = False
+                self.persistence.save_config(self.config_storage.config)
+                info("ADMIN", f"[{self._log_prefix()}] Fixed position removed")
             
             elif admin_msg.HasField('set_module_config'):
                 module_type = admin_msg.set_module_config.WhichOneof('payload_variant')
