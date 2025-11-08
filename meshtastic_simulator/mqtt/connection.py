@@ -4,6 +4,7 @@
 
 import ssl
 import time
+import threading
 from typing import Optional, Callable, Any
 
 try:
@@ -22,7 +23,8 @@ class MQTTConnection:
                  node_id: str,
                  on_connect_callback: Optional[Callable[[Any, Any, Any, int, Any, Any], None]] = None,
                  on_disconnect_callback: Optional[Callable[[Any, Any, int, Any, Any], None]] = None,
-                 on_message_callback: Optional[Callable[[Any, Any, Any], None]] = None) -> None:
+                 on_message_callback: Optional[Callable[[Any, Any, Any], None]] = None,
+                 auto_reconnect: bool = True) -> None:
         """
         Инициализирует MQTT подключение
         
@@ -46,6 +48,10 @@ class MQTTConnection:
         self.on_connect_callback = on_connect_callback
         self.on_disconnect_callback = on_disconnect_callback
         self.on_message_callback = on_message_callback
+        self.auto_reconnect = auto_reconnect
+        self._reconnect_thread = None
+        self._reconnect_stop = False
+        self._reconnect_lock = threading.Lock()
     
     def connect(self) -> bool:
         """
@@ -92,8 +98,12 @@ class MQTTConnection:
             self.client.tls_set(cert_reqs=ssl.CERT_NONE)
             self.client.tls_insecure_set(True)
         
+        # ВАЖНО: Устанавливаем keepalive (как в firmware - по умолчанию 60 секунд)
+        # Это нужно для обнаружения разорванных соединений
+        keepalive = 60
+        
         try:
-            self.client.connect(self.broker, self.port, 60)
+            self.client.connect(self.broker, self.port, keepalive)
             self.client.loop_start()
             # Ждем подключения или ошибки (максимум 3 секунды)
             for _ in range(30):  # 30 * 0.1 = 3 секунды
@@ -121,6 +131,8 @@ class MQTTConnection:
         # Проверяем успешное подключение (0 = успех)
         if result_code == 0 or (isinstance(result_code, int) and result_code == 0):
             self.connected = True
+            # Останавливаем автоматическое переподключение, так как мы подключены
+            self._reconnect_stop = True
             info("MQTT", f"Connected to {self.broker}:{self.port}")
             if self.on_connect_callback:
                 self.on_connect_callback(client, userdata, flags, rc, properties, reasonCode)
@@ -144,7 +156,7 @@ class MQTTConnection:
             elif hasattr(properties, '__class__'):
                 # Если properties - это объект другого типа, пытаемся получить строковое представление
                 debug("MQTT", f"Disconnected from broker: Unknown error type: {properties.__class__.__name__} (code: {properties})")
-                return
+                result_code = rc
             else:
                 result_code = rc
         elif reasonCode is not None:
@@ -161,8 +173,51 @@ class MQTTConnection:
             error_msg = self._get_error_message(result_code)
             warn("MQTT", f"Disconnected from broker: {error_msg} (code: {result_code})")
         
+        # ВАЖНО: Автоматическое переподключение (как в firmware MQTT::runOnce - проверяет loop() и переподключается)
+        # Запускаем переподключение в отдельном потоке, чтобы не блокировать callback
+        if self.auto_reconnect and not self._reconnect_stop:
+            self._start_auto_reconnect()
+        
         if self.on_disconnect_callback:
             self.on_disconnect_callback(client, userdata, rc, properties, reasonCode)
+    
+    def _start_auto_reconnect(self):
+        """Запускает автоматическое переподключение в отдельном потоке"""
+        with self._reconnect_lock:
+            if self._reconnect_thread and self._reconnect_thread.is_alive():
+                # Переподключение уже запущено
+                return
+            
+            self._reconnect_stop = False
+            self._reconnect_thread = threading.Thread(target=self._auto_reconnect_loop, daemon=True)
+            self._reconnect_thread.start()
+    
+    def _auto_reconnect_loop(self):
+        """Цикл автоматического переподключения (как в firmware MQTT::runOnce)"""
+        import time
+        reconnect_delay = 5  # Начальная задержка 5 секунд
+        max_delay = 30  # Максимальная задержка 30 секунд (как в firmware)
+        
+        while not self._reconnect_stop:
+            if self.connected:
+                # Уже подключены - выходим
+                break
+            
+            # Пытаемся переподключиться
+            info("MQTT", f"Attempting to reconnect to {self.broker}:{self.port} (delay: {reconnect_delay}s)")
+            if self.reconnect():
+                info("MQTT", f"Successfully reconnected to {self.broker}:{self.port}")
+                break
+            else:
+                # Увеличиваем задержку для следующей попытки (экспоненциальный backoff)
+                reconnect_delay = min(reconnect_delay * 2, max_delay)
+                info("MQTT", f"Reconnection failed, will retry in {reconnect_delay}s")
+            
+            # Ждем перед следующей попыткой
+            for _ in range(reconnect_delay * 10):  # Проверяем каждые 0.1 секунды
+                if self._reconnect_stop:
+                    break
+                time.sleep(0.1)
     
     def _get_error_message(self, code: Any) -> str:
         """Возвращает текстовое описание ошибки MQTT"""
@@ -263,6 +318,11 @@ class MQTTConnection:
     
     def disconnect(self) -> None:
         """Отключается от MQTT брокера"""
+        # Останавливаем автоматическое переподключение
+        self._reconnect_stop = True
+        if self._reconnect_thread and self._reconnect_thread.is_alive():
+            self._reconnect_thread.join(timeout=2)
+        
         if self.client:
             try:
                 # Останавливаем loop перед disconnect для корректного завершения
@@ -290,13 +350,41 @@ class MQTTConnection:
     
     def reconnect(self) -> bool:
         """
-        Переподключается к MQTT брокеру
+        Переподключается к MQTT брокеру (как в firmware MQTT::reconnect)
         
         Returns:
             True если переподключение успешно, False иначе
         """
-        self.disconnect()
+        # Останавливаем текущее соединение, но не останавливаем автоматическое переподключение
+        old_reconnect_stop = self._reconnect_stop
+        self._reconnect_stop = True  # Временно останавливаем, чтобы не создавать дубликаты
+        
+        if self.client:
+            try:
+                # Останавливаем loop перед disconnect
+                try:
+                    if hasattr(self.client, '_thread') and self.client._thread and self.client._thread.is_alive():
+                        self.client.loop_stop()
+                        time.sleep(0.2)
+                except:
+                    pass
+                # Отключаемся от брокера
+                try:
+                    self.client.disconnect()
+                except:
+                    pass
+            except Exception as e:
+                debug("MQTT", f"Error during disconnect before reconnect: {e}")
+            finally:
+                self.connected = False
+        
+        # Восстанавливаем флаг автоматического переподключения
+        self._reconnect_stop = old_reconnect_stop
+        
+        # Ждем перед переподключением
         time.sleep(1)
+        
+        # Переподключаемся
         return self.connect()
     
     def get_client(self) -> Optional[mqtt.Client]:
