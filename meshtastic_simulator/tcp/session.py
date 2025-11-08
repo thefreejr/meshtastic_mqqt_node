@@ -835,7 +835,15 @@ class TCPConnectionSession:
                     return
                 
                 device_metadata = mesh_pb2.DeviceMetadata()
-                device_metadata.firmware_version = NodeConfig.FIRMWARE_VERSION
+                # ВАЖНО: Убеждаемся, что версия прошивки всегда установлена и не пустая
+                # (клиент проверяет версию и требует обновление, если версия меньше минимальной или пустая)
+                firmware_version = NodeConfig.FIRMWARE_VERSION
+                if not firmware_version or firmware_version.strip() == "":
+                    # Если версия не установлена, используем дефолтную (достаточно новую)
+                    firmware_version = "2.6.11"
+                    warn("ADMIN", f"[{self._log_prefix()}] Firmware version not set, using default: {firmware_version}")
+                device_metadata.firmware_version = firmware_version
+                debug("ADMIN", f"[{self._log_prefix()}] Sending DeviceMetadata with firmware_version: {firmware_version}")
                 device_metadata.device_state_version = 1
                 device_metadata.canShutdown = True
                 device_metadata.hasWifi = False

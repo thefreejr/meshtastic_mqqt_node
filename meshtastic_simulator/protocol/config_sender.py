@@ -187,7 +187,15 @@ class ConfigSender:
     def _send_metadata(self) -> None:
         """Отправляет DeviceMetadata"""
         metadata = mesh_pb2.DeviceMetadata()
-        metadata.firmware_version = NodeConfig.FIRMWARE_VERSION
+        # ВАЖНО: Убеждаемся, что версия прошивки всегда установлена и не пустая
+        # (клиент проверяет версию и требует обновление, если версия меньше минимальной или пустая)
+        firmware_version = NodeConfig.FIRMWARE_VERSION
+        if not firmware_version or firmware_version.strip() == "":
+            # Если версия не установлена, используем дефолтную (достаточно новую)
+            firmware_version = "2.6.11"
+            warn("CONFIG", f"Firmware version not set, using default: {firmware_version}")
+        metadata.firmware_version = firmware_version
+        debug("CONFIG", f"Sending DeviceMetadata with firmware_version: {firmware_version}")
         metadata.device_state_version = 1
         metadata.canShutdown = True
         metadata.hasWifi = False
