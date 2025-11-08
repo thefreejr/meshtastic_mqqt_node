@@ -13,7 +13,7 @@ services:
     
     # Volumes для конфигурации, логов и данных
     volumes:
-      - ./mosquitto/config:/mosquitto/config:ro
+      - ./mosquitto/config:/mosquitto/config:rw
       - ./mosquitto/logs:/mosquitto/logs:rw
       - ./mosquitto/data:/mosquitto/data:rw
     
