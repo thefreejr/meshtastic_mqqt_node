@@ -269,7 +269,7 @@ class MQTTPacketProcessor:
                             return False
                     else:
                         debug("PKI", f"Rejecting PKI message (from !{packet_from:08X} to !{packet_to:08X}) - not to us and no NodeDB")
-                        return False
+                    return False
                 payload_type = packet.WhichOneof('payload_variant')
             
             # Устанавливаем метаданные
@@ -397,9 +397,17 @@ class MQTTPacketProcessor:
                                         node_info.user.long_name = session.owner.long_name
                                         node_info.user.short_name = session.owner.short_name
                                         node_info.user.is_licensed = session.owner.is_licensed
+                                        # ВАЖНО: Всегда включаем публичный ключ из сессии, если он есть (для PKI)
                                         if session.owner.public_key and len(session.owner.public_key) > 0:
                                             if not session.owner.is_licensed:
                                                 node_info.user.public_key = session.owner.public_key
+                                        # ВАЖНО: Если в NodeDB получателя уже есть публичный ключ для этого узла, сохраняем его
+                                        # (на случай, если сессия не имеет ключа, но мы его уже знаем)
+                                        existing_node = self.node_db.get_mesh_node(packet_from)
+                                        if existing_node and hasattr(existing_node.user, 'public_key') and len(existing_node.user.public_key) == 32:
+                                            if not hasattr(node_info.user, 'public_key') or len(node_info.user.public_key) != 32:
+                                                node_info.user.public_key = existing_node.user.public_key
+                                                debug("MQTT", f"Восстановлен public_key из NodeDB для !{packet_from:08X} при отправке NodeInfo клиенту")
                                         
                                         # Добавляем телеметрию из сессии отправителя (если есть)
                                         try:
