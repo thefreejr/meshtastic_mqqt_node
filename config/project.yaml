@@ -15,7 +15,7 @@ mqtt:
 
 # Логирование
 logging:
-  level: "DEBUG"  # DEBUG, INFO, WARN, ERROR, NONE
+  level: "INFO"  # DEBUG, INFO, WARN, ERROR, NONE
   categories: null  # null = все категории, или список: ["TCP", "MQTT", "ADMIN","PERSISTENCE","ACK"]
   file: logs/simulator.log  # null = не записывать в файл, или путь: "logs/simulator.log" (в Docker будет в volume ./logs)
 
