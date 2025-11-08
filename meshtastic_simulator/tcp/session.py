@@ -33,6 +33,7 @@ from ..mesh.config_storage import ConfigStorage, NodeConfig
 from ..mesh.persistence import Persistence
 from ..mesh.rtc import RTC, RTCQuality, RTCSetResult, get_valid_time
 from ..mqtt.client import MQTTClient
+from ..mqtt.subscription import MQTTSubscription
 from ..mesh import generate_node_id
 from ..mesh.pki_manager import PKIManager
 from ..mesh.settings_loader import SettingsLoader
@@ -613,7 +614,19 @@ class TCPConnectionSession:
             elif admin_msg.HasField('set_channel'):
                 self.channels.set_channel(admin_msg.set_channel)
                 self.persistence.save_channels(self.channels.channels)
-                info("ADMIN", f"[{self._log_prefix()}] Channel {admin_msg.set_channel.index} set")
+                ch_index = admin_msg.set_channel.index
+                ch = self.channels.get_by_index(ch_index)
+                channel_id = self.channels.get_global_id(ch_index)
+                info("ADMIN", f"[{self._log_prefix()}] Channel {ch_index} set: role={ch.role}, name={ch.settings.name if ch.settings.name else 'N/A'}, downlink_enabled={ch.settings.downlink_enabled}, global_id={channel_id}")
+                
+                # ВАЖНО: После изменения канала нужно переподписаться на MQTT топики
+                # (как в firmware MQTT::sendSubscriptions вызывается после изменения каналов)
+                if self.mqtt_client and self.mqtt_client.connected and self.mqtt_client.client:
+                    info("MQTT", f"[{self._log_prefix()}] Resubscribing to MQTT topics after channel {ch_index} update...")
+                    # Обновляем subscription с новыми каналами
+                    self.mqtt_client.subscription = MQTTSubscription(self.mqtt_client.root_topic, self.channels, self.mqtt_client.node_id)
+                    # Переподписываемся на все каналы
+                    self.mqtt_client.subscription.subscribe_to_channels(self.mqtt_client.client)
             
             elif admin_msg.HasField('set_config'):
                 config_type = admin_msg.set_config.WhichOneof('payload_variant')

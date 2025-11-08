@@ -261,13 +261,19 @@ class MQTTPacketProcessor:
                     session_found = False
                     if self.server and envelope.gateway_id:
                         try:
-                            # Ищем сессию по node_id (gateway_id)
+                            # Ищем сессию по node_id (gateway_id) или по packet_from (node_num)
+                            # Нормализуем gateway_id (приводим к верхнему регистру для сравнения)
                             gateway_node_id = envelope.gateway_id if isinstance(envelope.gateway_id, str) else f"!{envelope.gateway_id:08X}"
-                            debug("MQTT", f"Looking for session with gateway_id={gateway_node_id}, packet_from=!{packet_from:08X}")
+                            gateway_node_id = gateway_node_id.upper()  # Приводим к верхнему регистру
+                            packet_from_node_id = f"!{packet_from:08X}"  # node_id из packet.from
+                            debug("MQTT", f"Looking for session with gateway_id={gateway_node_id}, packet_from={packet_from_node_id}")
                             with self.server.sessions_lock:
                                 for session in self.server.active_sessions.values():
-                                    debug("MQTT", f"Checking session: node_id={session.node_id}, owner={session.owner.short_name if hasattr(session, 'owner') and session.owner.short_name else 'N/A'}")
-                                    if session.node_id == gateway_node_id:
+                                    session_node_id = session.node_id.upper() if isinstance(session.node_id, str) else session.node_id
+                                    session_node_num = session.node_num & 0x7FFFFFFF
+                                    debug("MQTT", f"Checking session: node_id={session.node_id}, node_num={session_node_num:08X}, owner={session.owner.short_name if hasattr(session, 'owner') and session.owner.short_name else 'N/A'}")
+                                    # Ищем по gateway_id (node_id сессии) или по packet_from (node_num сессии)
+                                    if session_node_id == gateway_node_id or session_node_num == packet_from:
                                         session_found = True
                                         # Нашли сессию отправителя - используем информацию о владельце
                                         node_info.user.id = session.owner.id
@@ -318,7 +324,9 @@ class MQTTPacketProcessor:
                                         break
                             
                             if not session_found:
-                                warn("MQTT", f"Session not found for gateway_id={gateway_node_id}, packet_from=!{packet_from:08X}. Using info from NodeDB.")
+                                # Это нормально для внешних узлов (не локальных сессий)
+                                # Используем информацию из NodeDB, которая обновляется при получении пакетов
+                                debug("MQTT", f"Session not found for gateway_id={gateway_node_id}, packet_from=!{packet_from:08X} (external node, using NodeDB)")
                                 # Если сессия не найдена, пытаемся получить информацию из NodeDB
                                 # (может быть, это пакет от другого узла, который уже обработан ранее)
                                 if hasattr(node_info, 'user') and node_info.user.short_name:

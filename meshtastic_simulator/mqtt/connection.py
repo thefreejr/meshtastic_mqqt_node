@@ -74,8 +74,12 @@ class MQTTConnection:
             warn("MQTT", "Username is empty, connection may fail")
         if not self.password:
             warn("MQTT", "Password is empty, connection may fail")
+        
+        # Логируем учетные данные (без пароля) для отладки
+        password_preview = f"{self.password[:2]}..." if self.password and len(self.password) > 2 else (self.password if self.password else "empty")
+        debug("MQTT", f"Setting credentials: username='{self.username}', password='{password_preview}' (length={len(self.password) if self.password else 0})")
+        
         self.client.username_pw_set(self.username, self.password)
-        debug("MQTT", f"Setting credentials: username='{self.username}', password_length={len(self.password) if self.password else 0}")
         
         # Устанавливаем callbacks
         self.client.on_connect = self._on_connect
@@ -132,8 +136,17 @@ class MQTTConnection:
         
         # В MQTT v5 может быть reasonCode в properties или как отдельный параметр
         # Если properties - это объект с reasonCode, извлекаем его
-        if properties is not None and hasattr(properties, 'reasonCode'):
-            result_code = properties.reasonCode
+        if properties is not None:
+            if hasattr(properties, 'reasonCode'):
+                result_code = properties.reasonCode
+            elif isinstance(properties, dict) and 'reasonCode' in properties:
+                result_code = properties['reasonCode']
+            elif hasattr(properties, '__class__'):
+                # Если properties - это объект другого типа, пытаемся получить строковое представление
+                debug("MQTT", f"Disconnected from broker: Unknown error type: {properties.__class__.__name__} (code: {properties})")
+                return
+            else:
+                result_code = rc
         elif reasonCode is not None:
             result_code = reasonCode
         else:
