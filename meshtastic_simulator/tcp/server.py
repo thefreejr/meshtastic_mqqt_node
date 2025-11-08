@@ -317,8 +317,16 @@ class TCPServer:
         session.client_socket.settimeout(0.1)
         
         try:
+            last_position_check = 0
             while self.running:
                 try:
+                    # Периодическая отправка позиции (как в firmware PositionModule::runOnce)
+                    # Проверяем каждые 5 секунд (как RUNONCE_INTERVAL в firmware)
+                    current_time = time.time()
+                    if current_time - last_position_check >= 5.0:
+                        last_position_check = current_time
+                        session._run_position_broadcast()
+                    
                     # Обрабатываем пакеты из MQTT для этой сессии
                     if session.mqtt_client and hasattr(session.mqtt_client, 'to_client_queue'):
                         try:

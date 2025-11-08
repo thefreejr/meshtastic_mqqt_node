@@ -17,7 +17,7 @@ except ImportError:
 
 try:
     from meshtastic import mesh_pb2
-    from meshtastic.protobuf import admin_pb2, portnums_pb2
+    from meshtastic.protobuf import admin_pb2, portnums_pb2, config_pb2
     try:
         from meshtastic.protobuf import telemetry_pb2
     except ImportError:
@@ -86,6 +86,9 @@ class TCPConnectionSession:
         # Инициализируем телеметрию в NodeDB для нашей сессии
         self._init_telemetry()
         
+        # Инициализируем позицию в NodeDB для нашей сессии
+        self._init_position()
+        
         # PKI ключи (Curve25519) - индивидуальные для каждой сессии
         self.pki_private_key = None
         self.pki_public_key = None
@@ -141,6 +144,11 @@ class TCPConnectionSession:
         
         # Throttling для публикации NodeInfo (как в firmware NodeInfoModule - не чаще чем раз в 5 минут)
         self.last_nodeinfo_published = 0  # Время последней публикации NodeInfo в MQTT
+        
+        # Position broadcast tracking (как в firmware PositionModule)
+        self.last_position_send = 0  # Время последней отправки позиции (millis)
+        self.position_seq_number = 0  # Порядковый номер позиции (инкрементируется при каждой отправке)
+        self.prev_position_packet_id = 0  # ID предыдущего пакета позиции (для отмены, если нужно)
     
     def _init_telemetry(self) -> None:
         """Инициализирует телеметрию в NodeDB для этой сессии"""
@@ -159,6 +167,19 @@ class TCPConnectionSession:
                     debug("SESSION", f"[{self._log_prefix()}] Initialized device_metrics in NodeDB")
         except Exception as e:
             debug("SESSION", f"[{self._log_prefix()}] Error initializing telemetry: {e}")
+    
+    def _init_position(self) -> None:
+        """Инициализирует позицию в NodeDB для этой сессии (как в firmware)"""
+        try:
+            our_node = self.node_db.get_or_create_mesh_node(self.node_num)
+            # Инициализируем позицию, если её нет
+            if not hasattr(our_node, 'position'):
+                # Создаем пустую позицию (будет установлена клиентом или через AdminMessage)
+                position = mesh_pb2.Position()
+                our_node.position.CopyFrom(position)
+                debug("SESSION", f"[{self._log_prefix()}] Initialized position in NodeDB")
+        except Exception as e:
+            debug("SESSION", f"[{self._log_prefix()}] Error initializing position: {e}")
     
     def _log_prefix(self) -> str:
         """Возвращает префикс для логов с node_id и именем пользователя"""
@@ -272,6 +293,9 @@ class TCPConnectionSession:
             
             # Отправляем телеметрию в MQTT при подключении (как в firmware DeviceTelemetryModule)
             self._publish_telemetry_to_mqtt()
+            
+            # Отправляем позицию в MQTT при подключении (как в firmware PositionModule)
+            self._send_our_position()
         
         return self.mqtt_client
     
@@ -401,6 +425,260 @@ class TCPConnectionSession:
     def get_uptime_seconds(self) -> int:
         """Возвращает uptime в секундах для этой сессии"""
         return int(time.time() - self.created_at)
+    
+    def _alloc_position_packet(self, channel_index: int = 0) -> Optional[mesh_pb2.MeshPacket]:
+        """
+        Создает пакет с позицией (как в firmware PositionModule::allocPositionPacket)
+        
+        Args:
+            channel_index: Индекс канала для определения precision
+            
+        Returns:
+            MeshPacket с позицией или None если позиция невалидна
+        """
+        try:
+            # Получаем precision из настроек канала (как в firmware)
+            precision = 32  # По умолчанию полная точность
+            ch = self.channels.get_by_index(channel_index)
+            if hasattr(ch.settings, 'module_settings') and ch.settings.HasField('module_settings'):
+                if hasattr(ch.settings.module_settings, 'position_precision'):
+                    precision = ch.settings.module_settings.position_precision
+            
+            # Если precision = 0, не отправляем позицию (как в firmware)
+            if precision == 0:
+                debug("POSITION", f"[{self._log_prefix()}] Skip location send because precision is set to 0!")
+                return None
+            
+            # Получаем позицию из NodeDB
+            our_node = self.node_db.get_or_create_mesh_node(self.node_num)
+            if not hasattr(our_node, 'position') or not our_node.HasField('position'):
+                debug("POSITION", f"[{self._log_prefix()}] No position in NodeDB")
+                return None
+            
+            position = our_node.position
+            
+            # Проверяем, что координаты не нулевые (как в firmware)
+            if not hasattr(position, 'latitude_i') or not hasattr(position, 'longitude_i'):
+                debug("POSITION", f"[{self._log_prefix()}] Position missing latitude_i or longitude_i")
+                return None
+            
+            if position.latitude_i == 0 and position.longitude_i == 0:
+                debug("POSITION", f"[{self._log_prefix()}] Skip position send because lat/lon are zero!")
+                return None
+            
+            # Получаем position_flags из конфигурации
+            pos_flags = self.config_storage.config.position.position_flags
+            
+            # Создаем Position пакет (как в firmware PositionModule::allocPositionPacket)
+            p = mesh_pb2.Position()
+            
+            # lat/lon всегда включаются (с учетом precision)
+            if precision < 32 and precision > 0:
+                # Обрезаем координаты до указанной точности (как в firmware)
+                mask = (0xFFFFFFFF << (32 - precision)) & 0xFFFFFFFF
+                p.latitude_i = position.latitude_i & mask
+                p.longitude_i = position.longitude_i & mask
+                # Сдвигаем к центру возможной области (как в firmware)
+                p.latitude_i += (1 << (31 - precision))
+                p.longitude_i += (1 << (31 - precision))
+            else:
+                p.latitude_i = position.latitude_i
+                p.longitude_i = position.longitude_i
+            
+            p.precision_bits = precision
+            p.has_latitude_i = True
+            p.has_longitude_i = True
+            
+            # Время (всегда включается, если доступно)
+            from ..mesh.rtc import RTCQuality, get_valid_time
+            time_value = get_valid_time(RTCQuality.NTP)
+            if time_value > 0:
+                p.time = time_value
+            elif self.rtc.get_quality() >= RTCQuality.DEVICE:
+                p.time = self.rtc.get_valid_time(RTCQuality.DEVICE)
+            else:
+                p.time = 0
+            
+            # Источник местоположения
+            if self.config_storage.config.position.fixed_position:
+                p.location_source = mesh_pb2.Position.LocSource.LOC_MANUAL
+            elif hasattr(position, 'location_source'):
+                p.location_source = position.location_source
+            
+            # Условные поля на основе position_flags (как в firmware)
+            if pos_flags & 0x0001:  # ALTITUDE
+                if pos_flags & 0x0002:  # ALTITUDE_MSL
+                    if hasattr(position, 'altitude'):
+                        p.altitude = position.altitude
+                        p.has_altitude = True
+                else:
+                    if hasattr(position, 'altitude_hae'):
+                        p.altitude_hae = position.altitude_hae
+                        p.has_altitude_hae = True
+                
+                if pos_flags & 0x0004:  # GEOIDAL_SEPARATION
+                    if hasattr(position, 'altitude_geoidal_separation'):
+                        p.altitude_geoidal_separation = position.altitude_geoidal_separation
+                        p.has_altitude_geoidal_separation = True
+            
+            if pos_flags & 0x0008:  # DOP
+                if pos_flags & 0x0010:  # HVDOP
+                    if hasattr(position, 'HDOP'):
+                        p.HDOP = position.HDOP
+                    if hasattr(position, 'VDOP'):
+                        p.VDOP = position.VDOP
+                else:
+                    if hasattr(position, 'PDOP'):
+                        p.PDOP = position.PDOP
+            
+            if pos_flags & 0x0020:  # SATINVIEW
+                if hasattr(position, 'sats_in_view'):
+                    p.sats_in_view = position.sats_in_view
+            
+            if pos_flags & 0x0080:  # TIMESTAMP
+                if hasattr(position, 'timestamp'):
+                    p.timestamp = position.timestamp
+            
+            if pos_flags & 0x0040:  # SEQ_NO
+                self.position_seq_number += 1
+                p.seq_number = self.position_seq_number
+            
+            if pos_flags & 0x0100:  # HEADING
+                if hasattr(position, 'ground_track'):
+                    p.ground_track = position.ground_track
+                    p.has_ground_track = True
+            
+            if pos_flags & 0x0200:  # SPEED
+                if hasattr(position, 'ground_speed'):
+                    p.ground_speed = position.ground_speed
+                    p.has_ground_speed = True
+            
+            # Создаем MeshPacket
+            import random
+            from ..config import DEFAULT_HOP_LIMIT
+            
+            packet = mesh_pb2.MeshPacket()
+            packet.id = random.randint(1, 0xFFFFFFFF)
+            packet.to = 0xFFFFFFFF  # Broadcast
+            setattr(packet, 'from', self.node_num)
+            packet.channel = channel_index
+            packet.decoded.portnum = portnums_pb2.PortNum.POSITION_APP
+            packet.decoded.payload = p.SerializeToString()
+            packet.hop_limit = DEFAULT_HOP_LIMIT
+            packet.hop_start = DEFAULT_HOP_LIMIT
+            packet.want_ack = False
+            
+            # Определяем приоритет (как в firmware)
+            device_role = self.config_storage.config.device.role
+            if device_role == config_pb2.Config.DeviceConfig.Role.TRACKER or \
+               device_role == config_pb2.Config.DeviceConfig.Role.TAK_TRACKER:
+                packet.priority = mesh_pb2.MeshPacket.Priority.RELIABLE
+            else:
+                packet.priority = mesh_pb2.MeshPacket.Priority.BACKGROUND
+            
+            # Определяем want_response (как в firmware)
+            if device_role == config_pb2.Config.DeviceConfig.Role.TRACKER:
+                packet.decoded.want_response = False
+            else:
+                # Для других ролей можно запрашивать ответы при смене поколения радио
+                # Пока упростим: не запрашиваем ответы
+                packet.decoded.want_response = False
+            
+            debug("POSITION", f"[{self._log_prefix()}] Position packet created: time={p.time}, lat={p.latitude_i}, lon={p.longitude_i}, precision={precision}")
+            return packet
+            
+        except Exception as e:
+            error("POSITION", f"[{self._log_prefix()}] Error creating position packet: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _send_our_position(self, channel_index: int = 0) -> None:
+        """
+        Отправляет нашу позицию в MQTT (как в firmware PositionModule::sendOurPosition)
+        
+        Args:
+            channel_index: Индекс канала для отправки
+        """
+        if not self.mqtt_client or not self.mqtt_client.connected:
+            debug("POSITION", f"[{self._log_prefix()}] MQTT not connected, skipping position send")
+            return
+        
+        try:
+            # Ищем канал с включенной отправкой позиции (как в firmware)
+            # Перебираем каналы 0-7 и ищем первый с position_precision != 0
+            target_channel = None
+            for ch_num in range(MAX_NUM_CHANNELS):
+                ch = self.channels.get_by_index(ch_num)
+                if hasattr(ch.settings, 'module_settings') and ch.settings.HasField('module_settings'):
+                    if hasattr(ch.settings.module_settings, 'position_precision'):
+                        if ch.settings.module_settings.position_precision != 0:
+                            target_channel = ch_num
+                            break
+            
+            if target_channel is None:
+                # Если не нашли канал с включенной позицией, используем PRIMARY канал
+                target_channel = self.channels._get_primary_index()
+            
+            # Создаем пакет позиции
+            packet = self._alloc_position_packet(target_channel)
+            if packet is None:
+                debug("POSITION", f"[{self._log_prefix()}] Failed to create position packet")
+                return
+            
+            # Отменяем предыдущий неотправленный пакет позиции (если есть, как в firmware)
+            if self.prev_position_packet_id:
+                # В MQTT нет механизма отмены, но сохраняем ID для логирования
+                debug("POSITION", f"[{self._log_prefix()}] Previous position packet ID: {self.prev_position_packet_id}")
+            
+            self.prev_position_packet_id = packet.id
+            
+            # Отправляем в MQTT
+            self.mqtt_client.publish_packet(packet, target_channel)
+            self.last_position_send = int(time.time() * 1000)  # В миллисекундах
+            
+            info("POSITION", f"[{self._log_prefix()}] Published Position to MQTT: lat={packet.decoded.payload[:4] if len(packet.decoded.payload) >= 4 else 'N/A'}, channel={target_channel}")
+            
+        except Exception as e:
+            error("POSITION", f"[{self._log_prefix()}] Error sending position: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _run_position_broadcast(self) -> None:
+        """
+        Периодическая отправка позиции (как в firmware PositionModule::runOnce)
+        Вызывается периодически для проверки необходимости отправки позиции
+        """
+        if not self.mqtt_client or not self.mqtt_client.connected:
+            return
+        
+        try:
+            # Получаем интервал отправки из конфигурации (как в firmware)
+            broadcast_secs = self.config_storage.config.position.position_broadcast_secs
+            if broadcast_secs == 0:
+                broadcast_secs = 15 * 60  # Дефолт: 15 минут
+            
+            # Масштабируем интервал в зависимости от количества узлов (как в firmware)
+            # Упрощенная версия: просто используем базовый интервал
+            interval_ms = broadcast_secs * 1000
+            
+            now_ms = int(time.time() * 1000)
+            ms_since_last_send = now_ms - self.last_position_send
+            
+            # Проверяем, прошло ли достаточно времени (как в firmware)
+            if self.last_position_send == 0 or ms_since_last_send >= interval_ms:
+                # Проверяем, есть ли валидная позиция
+                our_node = self.node_db.get_or_create_mesh_node(self.node_num)
+                if hasattr(our_node, 'position') and our_node.HasField('position'):
+                    position = our_node.position
+                    if hasattr(position, 'latitude_i') and hasattr(position, 'longitude_i'):
+                        if position.latitude_i != 0 or position.longitude_i != 0:
+                            # Отправляем позицию
+                            self._send_our_position()
+                            debug("POSITION", f"[{self._log_prefix()}] Position broadcast sent (interval={broadcast_secs}s)")
+            
+        except Exception as e:
+            debug("POSITION", f"[{self._log_prefix()}] Error in position broadcast: {e}")
     
     def _send_from_radio(self, from_radio: mesh_pb2.FromRadio) -> None:
         """Отправляет FromRadio сообщение клиенту через TCP сокет"""
@@ -535,8 +813,38 @@ class TCPConnectionSession:
             debug("TCP", f"[{self._log_prefix()}] Packet before MQTT publish: from={final_from:08X}, to={packet.to:08X}, id={packet.id}")
             
             channel_index = packet.channel if packet.channel < MAX_NUM_CHANNELS else 0
+            
+            # Обработка пакетов позиции от клиента (как в firmware PositionModule::handleReceivedProtobuf)
+            if hasattr(packet.decoded, 'portnum') and packet.decoded.portnum == portnums_pb2.PortNum.POSITION_APP:
+                try:
+                    position = mesh_pb2.Position()
+                    position.ParseFromString(packet.decoded.payload)
+                    # Обновляем позицию в NodeDB (как в firmware nodeDB->updatePosition)
+                    self.node_db.update_position(self.node_num, position)
+                    debug("POSITION", f"[{self._log_prefix()}] Updated position from client: lat={position.latitude_i}, lon={position.longitude_i}")
+                except Exception as e:
+                    debug("POSITION", f"[{self._log_prefix()}] Error parsing position from client: {e}")
+            
             if self.mqtt_client:
                 self.mqtt_client.publish_packet(packet, channel_index)
+            
+            # Обработка запросов позиции (как в firmware PositionModule::allocReply)
+            if hasattr(packet.decoded, 'portnum') and packet.decoded.portnum == portnums_pb2.PortNum.POSITION_APP:
+                if hasattr(packet.decoded, 'want_response') and packet.decoded.want_response:
+                    # Клиент запрашивает позицию - отправляем ответ (как в firmware allocReply)
+                    debug("POSITION", f"[{self._log_prefix()}] Position request received, sending reply")
+                    reply_packet = self._alloc_position_packet(packet.channel if packet.channel < MAX_NUM_CHANNELS else 0)
+                    if reply_packet:
+                        # Настраиваем пакет как ответ (как в firmware)
+                        reply_packet.to = packet_from if packet_from != 0 else 0xFFFFFFFF
+                        reply_packet.decoded.want_response = False
+                        reply_packet.decoded.request_id = packet.id
+                        
+                        # Отправляем ответ клиенту через TCP
+                        from_radio = mesh_pb2.FromRadio()
+                        from_radio.packet.CopyFrom(reply_packet)
+                        self._send_from_radio(from_radio)
+                        info("POSITION", f"[{self._log_prefix()}] Sent position reply (request_id={packet.id})")
             
             # Используем PacketHandler для проверки необходимости отправки ACK
             if PacketHandler.should_send_ack(packet):

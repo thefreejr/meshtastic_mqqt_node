@@ -97,11 +97,18 @@ class NodeDB:
             traceback.print_exc()
     
     def update_position(self, node_num: int, position: mesh_pb2.Position):
-        """Обновляет информацию о позиции узла"""
+        """Обновляет информацию о позиции узла (как в firmware NodeDB::updatePosition)"""
         try:
             node_info = self.get_or_create_mesh_node(node_num)
-            if hasattr(node_info, 'position'):
-                node_info.position.CopyFrom(position)
+            # Инициализируем позицию, если её нет
+            if not hasattr(node_info, 'position'):
+                node_info.position = mesh_pb2.Position()
+            
+            # Обновляем позицию (как в firmware)
+            node_info.position.CopyFrom(position)
+            node_info.has_position = True
+            
+            debug("NODE", f"Updated position for node !{node_num:08X}: lat={position.latitude_i}, lon={position.longitude_i}")
         except Exception as e:
             error("NODE", f"Ошибка обновления позиции: {e}")
     
