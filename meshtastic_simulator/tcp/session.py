@@ -452,7 +452,9 @@ class TCPConnectionSession:
             # Получаем позицию из NodeDB
             our_node = self.node_db.get_or_create_mesh_node(self.node_num)
             if not hasattr(our_node, 'position') or not our_node.HasField('position'):
-                debug("POSITION", f"[{self._log_prefix()}] No position in NodeDB")
+                # Позиция еще не установлена - это нормально для MQTT-нод без GPS
+                # Позиция будет установлена клиентом через POSITION_APP или set_fixed_position
+                debug("POSITION", f"[{self._log_prefix()}] Position not set in NodeDB yet (will be set by client or fixed_position)")
                 return None
             
             position = our_node.position
@@ -623,7 +625,9 @@ class TCPConnectionSession:
             # Создаем пакет позиции
             packet = self._alloc_position_packet(target_channel)
             if packet is None:
-                debug("POSITION", f"[{self._log_prefix()}] Failed to create position packet")
+                # Это нормально, если позиция еще не установлена (для MQTT-нод без GPS)
+                # Позиция будет отправлена позже, когда клиент отправит её или установится fixed_position
+                debug("POSITION", f"[{self._log_prefix()}] Position not available yet (will be sent when set by client or fixed_position)")
                 return
             
             # Отменяем предыдущий неотправленный пакет позиции (если есть, как в firmware)

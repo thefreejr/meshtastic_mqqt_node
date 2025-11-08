@@ -120,6 +120,15 @@ class MQTTClient:
                 self.password = DEFAULT_MQTT_PASSWORD
                 debug("MQTT", f"Password not set, using default (length: {len(DEFAULT_MQTT_PASSWORD) if DEFAULT_MQTT_PASSWORD else 0})")
             
+            # ВАЖНО: Если настройки изменились (username или password), сбрасываем флаг ошибки авторизации
+            # и разрешаем переподключение с новыми учетными данными
+            if (old_username != self.username or old_password != self.password or 
+                old_broker != self.broker or old_port != self.port):
+                if self.connection and hasattr(self.connection, '_auth_failed'):
+                    self.connection._auth_failed = False
+                    self.connection._reconnect_stop = False
+                    info("MQTT", "MQTT settings changed, resetting auth failure flag and enabling reconnection")
+            
             # Обновляем корневой топик (как в firmware)
             if hasattr(mqtt_config, 'root') and mqtt_config.root:
                 new_root = mqtt_config.root.strip()
