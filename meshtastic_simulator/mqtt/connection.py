@@ -146,11 +146,23 @@ class MQTTConnection:
         """Callback при отключении от MQTT"""
         # ВАЖНО: В paho-mqtt v2 может быть DisconnectFlags при подключении - это не ошибка
         # Проверяем это ПЕРВЫМ делом, до установки self.connected = False
-        if properties is not None and hasattr(properties, '__class__'):
-            if properties.__class__.__name__ == 'DisconnectFlags':
-                # Это не ошибка отключения, а просто флаги - игнорируем полностью
-                debug("MQTT", f"DisconnectFlags received (not an error, ignoring): {properties}")
-                return
+        # Проверяем разными способами, так как структура может отличаться
+        is_disconnect_flags = False
+        if properties is not None:
+            # Проверяем по имени класса
+            if hasattr(properties, '__class__') and properties.__class__.__name__ == 'DisconnectFlags':
+                is_disconnect_flags = True
+            # Проверяем по строковому представлению
+            elif 'DisconnectFlags' in str(type(properties)):
+                is_disconnect_flags = True
+            # Проверяем по атрибутам (если есть is_disconnect_packet_from_server)
+            elif hasattr(properties, 'is_disconnect_packet_from_server'):
+                is_disconnect_flags = True
+        
+        if is_disconnect_flags:
+            # Это не ошибка отключения, а просто флаги - игнорируем полностью
+            debug("MQTT", f"DisconnectFlags received (not an error, ignoring): {properties}")
+            return
         
         # Только если это реальное отключение, устанавливаем флаг
         self.connected = False

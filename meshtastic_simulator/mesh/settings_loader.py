@@ -151,12 +151,24 @@ class SettingsLoader:
         try:
             saved_owner = self.persistence.load_owner()
             if saved_owner:
+                # ВАЖНО: Сохраняем публичный ключ из файла перед CopyFrom
+                # (как в firmware - ключи сохраняются и переиспользуются)
+                saved_public_key = None
+                if hasattr(saved_owner, 'public_key') and len(saved_owner.public_key) == 32:
+                    saved_public_key = saved_owner.public_key
+                
                 self.owner.CopyFrom(saved_owner)
                 self.owner.id = self.node_id
                 
-                # Обновляем public_key если был сгенерирован
-                if self.pki_public_key and len(self.pki_public_key) == 32:
+                # ВАЖНО: Восстанавливаем публичный ключ из файла, если он был сохранен
+                # (не перезаписываем его новым ключом)
+                if saved_public_key:
+                    self.owner.public_key = saved_public_key
+                    debug("PERSISTENCE", f"{self.log_prefix} Restored public key from file: {saved_public_key[:8].hex()}...")
+                # Если в файле нет ключа, но был передан pki_public_key, используем его
+                elif self.pki_public_key and len(self.pki_public_key) == 32:
                     self.owner.public_key = self.pki_public_key
+                    debug("PERSISTENCE", f"{self.log_prefix} Using provided PKI public key: {self.pki_public_key[:8].hex()}...")
                 
                 info("PERSISTENCE", f"{self.log_prefix} Loaded Owner from file: {self.owner.long_name}/{self.owner.short_name}")
                 return True

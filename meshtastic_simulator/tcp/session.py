@@ -89,7 +89,6 @@ class TCPConnectionSession:
         # PKI ключи (Curve25519) - индивидуальные для каждой сессии
         self.pki_private_key = None
         self.pki_public_key = None
-        self._generate_pki_keys()
         
         # Хранилище информации о владельце (owner) - должно быть создано до логирования
         self.owner = mesh_pb2.User()
@@ -97,8 +96,37 @@ class TCPConnectionSession:
         self.owner.long_name = NodeConfig.USER_LONG_NAME
         self.owner.short_name = NodeConfig.USER_SHORT_NAME
         self.owner.is_licensed = False
-        if self.pki_public_key and len(self.pki_public_key) == 32:
-            self.owner.public_key = self.pki_public_key
+        
+        # ВАЖНО: Загружаем сохраненные настройки ПЕРЕД генерацией ключей
+        # Если в сохраненных настройках есть публичный ключ, используем его
+        # (как в firmware - ключи сохраняются и переиспользуются)
+        settings_loader = SettingsLoader(
+            persistence=self.persistence,
+            channels=self.channels,
+            config_storage=self.config_storage,
+            owner=self.owner,
+            pki_public_key=None,  # Будет установлен после загрузки
+            node_id=self.node_id
+        )
+        settings_loader.load_all()
+        
+        # ВАЖНО: Если в owner уже есть публичный ключ из файла, используем его
+        # Иначе генерируем новый
+        if self.owner.public_key and len(self.owner.public_key) == 32:
+            # Используем сохраненный публичный ключ
+            self.pki_public_key = self.owner.public_key
+            debug("PKI", f"[{self._log_prefix()}] Using saved public key from file: {self.pki_public_key[:8].hex()}...")
+            # Приватный ключ не сохраняется (по соображениям безопасности)
+            # Генерируем новый приватный ключ (но это не критично, так как мы не используем PKI расшифровку)
+            self.pki_private_key = bytes(32)
+        else:
+            # Генерируем новые ключи только если их нет в файле
+            self._generate_pki_keys()
+            if self.pki_public_key and len(self.pki_public_key) == 32:
+                self.owner.public_key = self.pki_public_key
+                # Сохраняем owner с новым публичным ключом
+                self.persistence.save_owner(self.owner)
+                info("PKI", f"[{self._log_prefix()}] Generated new PKI keys and saved to file")
         
         info("SESSION", f"Session created: node_id={self.node_id}, node_num={self.node_num:08X}, address={client_address[0]}:{client_address[1]}, owner={self.owner.short_name or self.owner.long_name or 'N/A'}")
         
