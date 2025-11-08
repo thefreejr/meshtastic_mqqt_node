@@ -245,7 +245,26 @@ class MQTTConnection:
         # ВАЖНО: Автоматическое переподключение (как в firmware MQTT::runOnce - проверяет loop() и переподключается)
         # НЕ переподключаемся, если была ошибка авторизации (пользователь должен изменить настройки)
         # Запускаем переподключение в отдельном потоке, чтобы не блокировать callback
+        # ВАЖНО: Проверяем флаг ДО запуска auto-reconnect, так как он может быть установлен в _on_connect
+        # (который вызывается перед _on_disconnect при ошибке подключения)
         if self.auto_reconnect and not self._reconnect_stop and not self._auth_failed:
+            # Дополнительная проверка: если это была ошибка авторизации, не запускаем auto-reconnect
+            # (флаг уже должен быть установлен в _on_connect, но проверяем на всякий случай)
+            if result_code is not None:
+                is_auth_error = False
+                if isinstance(result_code, int):
+                    is_auth_error = (result_code == 5 or result_code == 135)
+                elif hasattr(result_code, 'value'):
+                    is_auth_error = (result_code.value == 5 or result_code.value == 135)
+                elif "Not authorized" in str(result_code):
+                    is_auth_error = True
+                
+                if is_auth_error:
+                    # Это ошибка авторизации - не запускаем auto-reconnect
+                    # (флаг уже должен быть установлен в _on_connect)
+                    debug("MQTT", "Disconnect due to auth error, skipping auto-reconnect")
+                    return
+            
             self._start_auto_reconnect()
         
         if self.on_disconnect_callback:
@@ -278,19 +297,28 @@ class MQTTConnection:
                 # Уже подключены - выходим
                 break
             
+            # Проверяем флаг перед каждой попыткой (может измениться во время ожидания)
+            if self._auth_failed:
+                warn("MQTT", "Auto-reconnect stopped: authentication failed. Update MQTT settings to retry.")
+                break
+            
             # Пытаемся переподключиться
             info("MQTT", f"Attempting to reconnect to {self.broker}:{self.port} (delay: {reconnect_delay}s)")
             if self.reconnect():
                 info("MQTT", f"Successfully reconnected to {self.broker}:{self.port}")
                 break
             else:
+                # Проверяем, не была ли это ошибка авторизации
+                if self._auth_failed:
+                    warn("MQTT", "Reconnection stopped: authentication failed. Update MQTT settings to retry.")
+                    break
                 # Увеличиваем задержку для следующей попытки (экспоненциальный backoff)
                 reconnect_delay = min(reconnect_delay * 2, max_delay)
                 info("MQTT", f"Reconnection failed, will retry in {reconnect_delay}s")
             
             # Ждем перед следующей попыткой
             for _ in range(reconnect_delay * 10):  # Проверяем каждые 0.1 секунды
-                if self._reconnect_stop:
+                if self._reconnect_stop or self._auth_failed:
                     break
                 time.sleep(0.1)
     
@@ -430,6 +458,11 @@ class MQTTConnection:
         Returns:
             True если переподключение успешно, False иначе
         """
+        # Если была ошибка авторизации, не пытаемся переподключаться
+        if self._auth_failed:
+            debug("MQTT", "Skipping reconnect: authentication failed. Please update MQTT settings via AdminMessage.")
+            return False
+        
         # Останавливаем текущее соединение, но не останавливаем автоматическое переподключение
         old_reconnect_stop = self._reconnect_stop
         self._reconnect_stop = True  # Временно останавливаем, чтобы не создавать дубликаты
