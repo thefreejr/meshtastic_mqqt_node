@@ -25,7 +25,8 @@ class MQTTClient:
     """MQTT клиент для подключения к брокеру"""
     
     def __init__(self, broker: str, port: int, username: str, password: str, 
-                 root_topic: str, node_id: str, channels: Channels, node_db: NodeDB = None):
+                 root_topic: str, node_id: str, channels: Channels, node_db: NodeDB = None,
+                 server = None):
         self.broker = broker
         self.port = port
         self.username = username
@@ -34,12 +35,13 @@ class MQTTClient:
         self.node_id = node_id
         self.channels = channels
         self.node_db = node_db
+        self.server = server  # Ссылка на TCPServer для доступа к сессиям
         self.to_client_queue = queue.Queue()
         
         # Инициализируем модули
         self.connection = None
         self.subscription = MQTTSubscription(root_topic, channels, node_id)
-        self.packet_processor = MQTTPacketProcessor(node_id, channels, node_db)
+        self.packet_processor = MQTTPacketProcessor(node_id, channels, node_db, server)
         
         # Флаг для предотвращения повторной остановки
         self._stopped = False
@@ -228,6 +230,10 @@ class MQTTClient:
             
             channel_id = self.channels.get_global_id(channel_index)
             
+            # Логируем поле from перед отправкой
+            packet_from = getattr(packet, 'from', 0)
+            debug("MQTT", f"Publishing packet: from={packet_from:08X}, to={packet.to:08X}, id={packet.id}, channel={channel_index}")
+            
             envelope = mqtt_pb2.ServiceEnvelope()
             envelope.packet.CopyFrom(packet)
             envelope.channel_id = channel_id
@@ -241,12 +247,12 @@ class MQTTClient:
             if self.connected and self.client:
                 # Для Custom канала добавляем детальное логирование
                 if channel_id == "Custom":
-                    info("MQTT", f"📤 CUSTOM PACKET SENDING: topic={topic}, gateway_id={self.node_id}, channel_id={channel_id}, payload_size={len(payload)}")
+                    info("MQTT", f"📤 CUSTOM PACKET SENDING: topic={topic}, gateway_id={self.node_id}, channel_id={channel_id}, from={packet_from:08X}, payload_size={len(payload)}")
                 self.client.publish(topic, payload)
                 if channel_id == "Custom":
-                    info("MQTT", f"✅ CUSTOM PACKET SENT: topic={topic}")
+                    info("MQTT", f"✅ CUSTOM PACKET SENT: topic={topic}, from={packet_from:08X}")
                 else:
-                    info("MQTT", f"Packet sent: {topic} (channel {channel_index}: {channel_id})")
+                    info("MQTT", f"Packet sent: {topic} (channel {channel_index}: {channel_id}, from={packet_from:08X})")
                 return True
             else:
                 warn("MQTT", "MQTT not connected, packet not sent")

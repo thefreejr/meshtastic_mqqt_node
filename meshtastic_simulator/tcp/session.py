@@ -82,6 +82,9 @@ class TCPConnectionSession:
         self.persistence = Persistence(node_id=self.node_id)  # Уникальный файл для каждой сессии
         self.canned_messages = ""  # Шаблонные сообщения
         
+        # Инициализируем телеметрию в NodeDB для нашей сессии
+        self._init_telemetry()
+        
         # PKI ключи (Curve25519) - индивидуальные для каждой сессии
         self.pki_private_key = None
         self.pki_public_key = None
@@ -106,6 +109,24 @@ class TCPConnectionSession:
         
         # Флаг для предотвращения повторного закрытия
         self._closed = False
+    
+    def _init_telemetry(self) -> None:
+        """Инициализирует телеметрию в NodeDB для этой сессии"""
+        try:
+            from meshtastic.protobuf import telemetry_pb2
+            if telemetry_pb2:
+                our_node = self.node_db.get_or_create_mesh_node(self.node_num)
+                if not hasattr(our_node, 'device_metrics') or not our_node.HasField('device_metrics'):
+                    device_metrics = telemetry_pb2.DeviceMetrics()
+                    device_metrics.battery_level = NodeConfig.DEVICE_METRICS_BATTERY_LEVEL
+                    device_metrics.voltage = NodeConfig.DEVICE_METRICS_VOLTAGE
+                    device_metrics.channel_utilization = NodeConfig.DEVICE_METRICS_CHANNEL_UTILIZATION
+                    device_metrics.air_util_tx = NodeConfig.DEVICE_METRICS_AIR_UTIL_TX
+                    device_metrics.uptime_seconds = 0  # Будет обновляться при отправке NodeInfo
+                    our_node.device_metrics.CopyFrom(device_metrics)
+                    debug("SESSION", f"[{self._log_prefix()}] Initialized device_metrics in NodeDB")
+        except Exception as e:
+            debug("SESSION", f"[{self._log_prefix()}] Error initializing telemetry: {e}")
     
     def _log_prefix(self) -> str:
         """Возвращает префикс для логов с node_id и именем пользователя"""
@@ -204,7 +225,8 @@ class TCPConnectionSession:
                 root_topic=root,
                 node_id=self.node_id,
                 channels=self.channels,
-                node_db=self.node_db
+                node_db=self.node_db,
+                server=self.server  # Передаем ссылку на сервер для доступа к сессиям
             )
             
             if not self.mqtt_client.start():
@@ -212,8 +234,127 @@ class TCPConnectionSession:
                 return None
             
             info("MQTT", f"[{self._log_prefix()}] MQTT client created: {broker}:{port}")
+            
+            # Отправляем NodeInfo в MQTT при подключении (как в firmware publishNodeInfo)
+            self._publish_node_info_to_mqtt()
+            
+            # Отправляем телеметрию в MQTT при подключении (как в firmware DeviceTelemetryModule)
+            self._publish_telemetry_to_mqtt()
         
         return self.mqtt_client
+    
+    def _publish_node_info_to_mqtt(self) -> None:
+        """Отправляет NodeInfo в MQTT (как в firmware publishNodeInfo)"""
+        if not self.mqtt_client or not self.mqtt_client.connected:
+            return
+        
+        try:
+            import random
+            from ..config import DEFAULT_HOP_LIMIT
+            
+            # Обновляем телеметрию в NodeDB перед отправкой (чтобы uptime_seconds был актуальным)
+            try:
+                from meshtastic.protobuf import telemetry_pb2
+                if telemetry_pb2:
+                    our_node = self.node_db.get_or_create_mesh_node(self.node_num)
+                    if hasattr(our_node, 'device_metrics') and our_node.HasField('device_metrics'):
+                        our_node.device_metrics.uptime_seconds = self.get_uptime_seconds()
+                    else:
+                        device_metrics = telemetry_pb2.DeviceMetrics()
+                        device_metrics.battery_level = NodeConfig.DEVICE_METRICS_BATTERY_LEVEL
+                        device_metrics.voltage = NodeConfig.DEVICE_METRICS_VOLTAGE
+                        device_metrics.channel_utilization = NodeConfig.DEVICE_METRICS_CHANNEL_UTILIZATION
+                        device_metrics.air_util_tx = NodeConfig.DEVICE_METRICS_AIR_UTIL_TX
+                        device_metrics.uptime_seconds = self.get_uptime_seconds()
+                        our_node.device_metrics.CopyFrom(device_metrics)
+            except Exception as e:
+                debug("MQTT", f"[{self._log_prefix()}] Error updating telemetry: {e}")
+            
+            # Создаем User пакет с информацией о владельце (как в firmware NodeInfoModule)
+            user = mesh_pb2.User()
+            user.id = self.owner.id
+            user.long_name = self.owner.long_name
+            user.short_name = self.owner.short_name
+            user.is_licensed = self.owner.is_licensed
+            
+            # Публичный ключ (если не лицензирован)
+            if self.owner.public_key and len(self.owner.public_key) > 0:
+                if not self.owner.is_licensed:
+                    user.public_key = self.owner.public_key
+            
+            # Создаем MeshPacket с User payload (portnum=NODEINFO_APP)
+            packet = mesh_pb2.MeshPacket()
+            packet.id = random.randint(1, 0xFFFFFFFF)
+            packet.to = 0xFFFFFFFF  # Broadcast
+            setattr(packet, 'from', self.node_num)
+            packet.channel = 0  # Primary channel
+            packet.decoded.portnum = portnums_pb2.PortNum.NODEINFO_APP
+            packet.decoded.payload = user.SerializeToString()
+            packet.hop_limit = DEFAULT_HOP_LIMIT
+            packet.hop_start = DEFAULT_HOP_LIMIT
+            packet.want_ack = False
+            
+            # Отправляем в MQTT
+            self.mqtt_client.publish_packet(packet, 0)
+            info("MQTT", f"[{self._log_prefix()}] Published NodeInfo to MQTT: {self.owner.short_name}/{self.owner.long_name}")
+        except Exception as e:
+            error("MQTT", f"[{self._log_prefix()}] Error publishing NodeInfo to MQTT: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _publish_telemetry_to_mqtt(self) -> None:
+        """Отправляет телеметрию в MQTT (как в firmware DeviceTelemetryModule::sendTelemetry)"""
+        if not self.mqtt_client or not self.mqtt_client.connected:
+            return
+        
+        try:
+            import random
+            from ..config import DEFAULT_HOP_LIMIT
+            from meshtastic.protobuf import telemetry_pb2, portnums_pb2
+            
+            if not telemetry_pb2:
+                return
+            
+            # Получаем телеметрию из NodeDB
+            our_node = self.node_db.get_or_create_mesh_node(self.node_num)
+            if not hasattr(our_node, 'device_metrics') or not our_node.HasField('device_metrics'):
+                # Инициализируем телеметрию, если её нет
+                device_metrics = telemetry_pb2.DeviceMetrics()
+                device_metrics.battery_level = NodeConfig.DEVICE_METRICS_BATTERY_LEVEL
+                device_metrics.voltage = NodeConfig.DEVICE_METRICS_VOLTAGE
+                device_metrics.channel_utilization = NodeConfig.DEVICE_METRICS_CHANNEL_UTILIZATION
+                device_metrics.air_util_tx = NodeConfig.DEVICE_METRICS_AIR_UTIL_TX
+                device_metrics.uptime_seconds = self.get_uptime_seconds()
+                our_node.device_metrics.CopyFrom(device_metrics)
+            
+            # Обновляем uptime_seconds
+            our_node.device_metrics.uptime_seconds = self.get_uptime_seconds()
+            
+            # Создаем Telemetry пакет (как в firmware)
+            telemetry = telemetry_pb2.Telemetry()
+            telemetry.time = int(time.time())
+            # В protobuf Python для oneof полей используем прямое присваивание
+            telemetry.device_metrics.CopyFrom(our_node.device_metrics)
+            
+            # Создаем MeshPacket с Telemetry payload (portnum=TELEMETRY_APP)
+            packet = mesh_pb2.MeshPacket()
+            packet.id = random.randint(1, 0xFFFFFFFF)
+            packet.to = 0xFFFFFFFF  # Broadcast
+            setattr(packet, 'from', self.node_num)
+            packet.channel = 0  # Primary channel
+            packet.decoded.portnum = portnums_pb2.PortNum.TELEMETRY_APP
+            packet.decoded.payload = telemetry.SerializeToString()
+            packet.hop_limit = DEFAULT_HOP_LIMIT
+            packet.hop_start = DEFAULT_HOP_LIMIT
+            packet.want_ack = False
+            
+            # Отправляем в MQTT
+            self.mqtt_client.publish_packet(packet, 0)
+            info("MQTT", f"[{self._log_prefix()}] Published Telemetry to MQTT: battery={our_node.device_metrics.battery_level}, uptime={our_node.device_metrics.uptime_seconds}")
+        except Exception as e:
+            error("MQTT", f"[{self._log_prefix()}] Error publishing Telemetry to MQTT: {e}")
+            import traceback
+            traceback.print_exc()
     
     def get_uptime_seconds(self) -> int:
         """Возвращает uptime в секундах для этой сессии"""
@@ -335,6 +476,21 @@ class TCPConnectionSession:
             if PacketHandler.is_admin_packet(packet):
                 debug("TCP", f"[{self._log_prefix()}] AdminMessage detected, forwarding to handler (want_response={getattr(packet.decoded, 'want_response', False)})")
                 self._handle_admin_message(packet)
+            
+            # Устанавливаем поле from на наш node_num перед отправкой в MQTT
+            # (как в firmware Router.cpp: p->from = getFrom(p))
+            # ВАЖНО: Пакеты от клиента всегда имеют from=0, устанавливаем на наш node_num
+            if packet_from == 0:
+                setattr(packet, 'from', self.node_num)
+                info("TCP", f"[{self._log_prefix()}] Set packet.from={self.node_num:08X} (was 0) before MQTT publish")
+            else:
+                # Если from уже установлен, это может быть пересылаемый пакет
+                # Но для пакетов от клиента через TCP это не должно происходить
+                warn("TCP", f"[{self._log_prefix()}] Packet already has from={packet_from:08X}, not setting to {self.node_num:08X}")
+            
+            # Проверяем значение перед отправкой
+            final_from = getattr(packet, 'from', 0)
+            debug("TCP", f"[{self._log_prefix()}] Packet before MQTT publish: from={final_from:08X}, to={packet.to:08X}, id={packet.id}")
             
             channel_index = packet.channel if packet.channel < MAX_NUM_CHANNELS else 0
             if self.mqtt_client:

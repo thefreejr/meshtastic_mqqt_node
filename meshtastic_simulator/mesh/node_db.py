@@ -63,17 +63,34 @@ class NodeDB:
             node_info.snr = packet.rx_snr
         if hasattr(packet, 'via_mqtt'):
             node_info.via_mqtt = packet.via_mqtt
+        # Устанавливаем hops_away (как в firmware NodeDB::updateFrom)
+        # Если hopStart был установлен и limit <= hopStart, вычисляем hops_away
         if hasattr(packet, 'hop_start') and hasattr(packet, 'hop_limit'):
             if packet.hop_start != 0 and packet.hop_limit <= packet.hop_start:
-                node_info.hops_away = packet.hop_start - packet.hop_limit
+                hops_away = packet.hop_start - packet.hop_limit
+                node_info.hops_away = hops_away
+                # В protobuf Python для optional полей флаг HasField устанавливается автоматически при установке значения
+                debug("NODE", f"Set hops_away={hops_away} for node !{packet_from:08X} (hop_start={packet.hop_start}, hop_limit={packet.hop_limit})")
+            else:
+                # Если hops_away не может быть вычислен, устанавливаем 0 (прямой сосед)
+                # Но только если поле еще не установлено
+                if not hasattr(node_info, 'hops_away') or not node_info.HasField('hops_away'):
+                    node_info.hops_away = 0
     
     def update_telemetry(self, node_num: int, device_metrics: Any) -> None:
-        """Обновляет информацию о telemetry устройства"""
+        """Обновляет информацию о telemetry устройства (как в firmware NodeDB::updateTelemetry)"""
         try:
             node_info = self.get_or_create_mesh_node(node_num)
             if hasattr(node_info, 'device_metrics'):
+                # ВАЖНО: Копируем телеметрию (как в firmware: info->device_metrics = t.variant.device_metrics)
                 node_info.device_metrics.CopyFrom(device_metrics)
-                battery_level = getattr(device_metrics, 'battery_level', 0)
+                # В protobuf Python флаг HasField('device_metrics') устанавливается автоматически при CopyFrom,
+                # но только если хотя бы одно поле установлено и не равно дефолтному
+                # Убеждаемся, что battery_level установлен (не 0), чтобы флаг был установлен
+                if not hasattr(node_info.device_metrics, 'battery_level') or node_info.device_metrics.battery_level == 0:
+                    node_info.device_metrics.battery_level = getattr(device_metrics, 'battery_level', 100)
+                battery_level = getattr(node_info.device_metrics, 'battery_level', 0)
+                debug("NODE", f"Updated telemetry for !{node_num:08X}: battery={battery_level}, has_field={node_info.HasField('device_metrics')}")
         except Exception as e:
             error("NODE", f"Ошибка обновления telemetry: {e}")
             import traceback
