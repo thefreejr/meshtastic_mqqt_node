@@ -705,11 +705,11 @@ class MQTTPacketProcessor:
             # ВАЖНО: Для PKI канала пакеты отправляются даже если не расшифрованы (как в firmware MQTT.cpp:117-123)
             # ВАЖНО: Проверяем, что очередь не переполнена (предотвращает утечку памяти)
             try:
-            from_radio = mesh_pb2.FromRadio()
-            from_radio.packet.CopyFrom(packet)
-            
-            serialized = from_radio.SerializeToString()
-            framed = StreamAPI.add_framing(serialized)
+                from_radio = mesh_pb2.FromRadio()
+                from_radio.packet.CopyFrom(packet)
+                
+                serialized = from_radio.SerializeToString()
+                framed = StreamAPI.add_framing(serialized)
                 # Используем put_nowait для избежания блокировки, если очередь переполнена
                 try:
                     to_client_queue.put_nowait(framed)
