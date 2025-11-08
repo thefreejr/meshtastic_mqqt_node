@@ -109,6 +109,11 @@ class NodeDB:
         """Обновляет информацию о пользователе узла (как в firmware NodeDB::updateUser)"""
         node_info = self.get_or_create_mesh_node(node_num)
         
+        # ВАЖНО: Логика обработки публичного ключа (как в firmware NodeDB.cpp:1670-1699)
+        # Проверка публичного ключа выполняется только для удаленных узлов (не для нашего собственного)
+        # (как в firmware: `if (p.public_key.size == 32 && nodeId != nodeDB->getNodeNum())`)
+        is_our_node = (node_num == self.our_node_num)
+        
         # ВАЖНО: Логика обработки публичного ключа (как в firmware NodeDB.cpp:1690-1699)
         # Если у узла уже есть публичный ключ, проверяем совпадение
         # Если ключ не совпадает, отклоняем обновление (как в firmware)
@@ -120,8 +125,9 @@ class NodeDB:
         if hasattr(user, 'public_key') and len(user.public_key) == 32:
             incoming_public_key = user.public_key
         
-        # Проверяем совпадение ключей (как в firmware: "if the key doesn't match, don't update nodeDB at all")
-        if existing_public_key and incoming_public_key:
+        # Проверяем совпадение ключей только для удаленных узлов (как в firmware)
+        # Для нашего собственного узла пропускаем проверку ключа
+        if not is_our_node and existing_public_key and incoming_public_key:
             # У узла уже есть ключ И в новом User есть ключ - проверяем совпадение
             if existing_public_key != incoming_public_key:
                 warn("NODE", f"Public Key mismatch для узла !{node_num:08X}, пропускаем обновление (как в firmware)")
@@ -130,7 +136,10 @@ class NodeDB:
                 debug("NODE", f"Public Key set for node !{node_num:08X}, not updating (как в firmware)")
         elif incoming_public_key and not existing_public_key:
             # У узла нет ключа, но в новом User есть - сохраняем новый (как в firmware: "Update Node Pubkey!")
-            info("NODE", f"Update Node Pubkey для !{node_num:08X}!")
+            if not is_our_node:
+                info("NODE", f"Update Node Pubkey для !{node_num:08X}!")
+            else:
+                debug("NODE", f"Update Node Pubkey для нашего собственного узла !{node_num:08X}")
         
         # ВАЖНО: Сохраняем существующий публичный ключ, если он есть и в новом User его нет
         # (как в firmware - ключ не теряется при обновлении других полей)

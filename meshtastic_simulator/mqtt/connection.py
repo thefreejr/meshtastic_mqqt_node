@@ -154,8 +154,13 @@ class MQTTConnection:
             elif isinstance(properties, dict) and 'reasonCode' in properties:
                 result_code = properties['reasonCode']
             elif hasattr(properties, '__class__'):
-                # Если properties - это объект другого типа, пытаемся получить строковое представление
-                debug("MQTT", f"Disconnected from broker: Unknown error type: {properties.__class__.__name__} (code: {properties})")
+                # В paho-mqtt v2 может быть DisconnectFlags при подключении - это не ошибка
+                if properties.__class__.__name__ == 'DisconnectFlags':
+                    # Это не ошибка отключения, а просто флаги - игнорируем
+                    debug("MQTT", f"DisconnectFlags received (not an error): {properties}")
+                    return
+                else:
+                    debug("MQTT", f"Disconnected from broker: Unknown error type: {properties.__class__.__name__} (code: {properties})")
                 result_code = rc
             else:
                 result_code = rc
