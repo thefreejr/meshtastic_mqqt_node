@@ -144,6 +144,15 @@ class MQTTConnection:
     
     def _on_disconnect(self, client, userdata, rc, properties=None, reasonCode=None):
         """Callback при отключении от MQTT"""
+        # ВАЖНО: В paho-mqtt v2 может быть DisconnectFlags при подключении - это не ошибка
+        # Проверяем это ПЕРВЫМ делом, до установки self.connected = False
+        if properties is not None and hasattr(properties, '__class__'):
+            if properties.__class__.__name__ == 'DisconnectFlags':
+                # Это не ошибка отключения, а просто флаги - игнорируем полностью
+                debug("MQTT", f"DisconnectFlags received (not an error, ignoring): {properties}")
+                return
+        
+        # Только если это реальное отключение, устанавливаем флаг
         self.connected = False
         
         # В MQTT v5 может быть reasonCode в properties или как отдельный параметр
@@ -154,13 +163,8 @@ class MQTTConnection:
             elif isinstance(properties, dict) and 'reasonCode' in properties:
                 result_code = properties['reasonCode']
             elif hasattr(properties, '__class__'):
-                # В paho-mqtt v2 может быть DisconnectFlags при подключении - это не ошибка
-                if properties.__class__.__name__ == 'DisconnectFlags':
-                    # Это не ошибка отключения, а просто флаги - игнорируем
-                    debug("MQTT", f"DisconnectFlags received (not an error): {properties}")
-                    return
-                else:
-                    debug("MQTT", f"Disconnected from broker: Unknown error type: {properties.__class__.__name__} (code: {properties})")
+                # Уже проверили DisconnectFlags выше, здесь обрабатываем другие типы
+                debug("MQTT", f"Disconnected from broker: Unknown error type: {properties.__class__.__name__} (code: {properties})")
                 result_code = rc
             else:
                 result_code = rc
