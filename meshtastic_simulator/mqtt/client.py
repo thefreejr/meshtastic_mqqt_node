@@ -124,6 +124,8 @@ class MQTTClient:
             # и разрешаем переподключение с новыми учетными данными
             if (old_username != self.username or old_password != self.password or 
                 old_broker != self.broker or old_port != self.port):
+                # Сбрасываем флаг в MQTTClient (сохраняется между пересозданиями connection)
+                self._auth_failed = False
                 if self.connection and hasattr(self.connection, '_auth_failed'):
                     self.connection._auth_failed = False
                     self.connection._reconnect_stop = False
@@ -176,12 +178,18 @@ class MQTTClient:
         def on_connect_callback(client, userdata, flags, rc, properties=None, reasonCode=None):
             if rc == 0:
                 # Сообщение о подключении уже выводится в MQTTConnection._on_connect
+                # Сбрасываем флаг ошибки авторизации при успешном подключении
+                self._auth_failed = False
                 # Подписываемся на каналы
                 self.subscription.subscribe_to_channels(client)
         
         # Создаем callback для обработки сообщений
         def on_message_callback(client, userdata, msg):
             self.packet_processor.process_mqtt_message(msg, self.to_client_queue)
+        
+        # Создаем callback для обновления флага ошибки авторизации
+        def on_auth_failed_callback():
+            self._auth_failed = True
         
         # Создаем подключение
         self.connection = MQTTConnection(
@@ -193,6 +201,14 @@ class MQTTClient:
             on_connect_callback=on_connect_callback,
             on_message_callback=on_message_callback
         )
+        
+        # Устанавливаем callback для обновления флага ошибки авторизации
+        self.connection._auth_failed_callback = on_auth_failed_callback
+        
+        # Восстанавливаем флаг ошибки авторизации из предыдущего подключения
+        if self._auth_failed:
+            self.connection._auth_failed = True
+            self.connection._reconnect_stop = True
         
         return self.connection.connect()
     

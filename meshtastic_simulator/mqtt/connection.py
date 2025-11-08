@@ -53,6 +53,7 @@ class MQTTConnection:
         self._reconnect_stop = False
         self._reconnect_lock = threading.Lock()
         self._auth_failed = False  # Флаг ошибки авторизации (останавливает переподключение)
+        self._auth_failed_callback = None  # Callback для обновления флага в родительском объекте
     
     def connect(self) -> bool:
         """
@@ -61,6 +62,12 @@ class MQTTConnection:
         Returns:
             True если подключение успешно, False иначе
         """
+        # Если была ошибка авторизации, не пытаемся подключаться
+        # Пользователь должен изменить настройки MQTT через AdminMessage
+        if self._auth_failed:
+            debug("MQTT", "Skipping connection attempt: authentication failed. Please update MQTT settings via AdminMessage.")
+            return False
+        
         try:
             # Создаем клиент с правильной версией API
             if hasattr(mqtt, 'CallbackAPIVersion'):
@@ -131,6 +138,9 @@ class MQTTConnection:
             if "Not authorized" in str(e) or "authorized" in str(e).lower():
                 self._auth_failed = True
                 self._reconnect_stop = True
+                # Обновляем флаг в родительском объекте (если есть callback)
+                if self._auth_failed_callback:
+                    self._auth_failed_callback()
                 warn("MQTT", "Authentication failed (Not authorized). Auto-reconnect stopped. Please update MQTT settings via AdminMessage.")
             return False
     
@@ -146,6 +156,8 @@ class MQTTConnection:
             self._reconnect_stop = True
             # Сбрасываем флаг ошибки авторизации при успешном подключении
             self._auth_failed = False
+            # Также сбрасываем флаг в родительском MQTTClient, если есть доступ
+            # (это делается через callback в MQTTClient.start)
             info("MQTT", f"Connected to {self.broker}:{self.port}")
             if self.on_connect_callback:
                 self.on_connect_callback(client, userdata, flags, rc, properties, reasonCode)
@@ -168,6 +180,9 @@ class MQTTConnection:
             if is_auth_error:
                 self._auth_failed = True
                 self._reconnect_stop = True
+                # Обновляем флаг в родительском объекте (если есть callback)
+                if self._auth_failed_callback:
+                    self._auth_failed_callback()
                 warn("MQTT", "Authentication failed (Not authorized). Auto-reconnect stopped. Please update MQTT settings via AdminMessage.")
     
     def _on_disconnect(self, client, userdata, rc, properties=None, reasonCode=None):
