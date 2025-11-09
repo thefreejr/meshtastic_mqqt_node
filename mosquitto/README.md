@@ -18,7 +18,8 @@ To create a password file for MQTT authentication:
 # Create password file with a user
 sudo docker exec -it meshtastic-mosquitto mosquitto_passwd -c /mosquitto/config/password.conf username
 
-
+# Add additional users
+sudo docker exec -it meshtastic-mosquitto mosquitto_passwd /mosquitto/config/password.conf another_username
 ```
 
 ### Option 2: Using local mosquitto_passwd

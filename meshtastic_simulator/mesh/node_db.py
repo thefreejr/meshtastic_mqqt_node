@@ -63,19 +63,19 @@ class NodeDB:
             node_info.snr = packet.rx_snr
         if hasattr(packet, 'via_mqtt'):
             node_info.via_mqtt = packet.via_mqtt
-        # Устанавливаем hops_away (как в firmware NodeDB::updateFrom)
+        
+        # Устанавливаем hops_away (как в firmware NodeDB::updateFrom, строка 1761-1765)
         # Если hopStart был установлен и limit <= hopStart, вычисляем hops_away
+        # ВАЖНО: Соответствует firmware - устанавливаем только если условие выполняется
         if hasattr(packet, 'hop_start') and hasattr(packet, 'hop_limit'):
             if packet.hop_start != 0 and packet.hop_limit <= packet.hop_start:
                 hops_away = packet.hop_start - packet.hop_limit
                 node_info.hops_away = hops_away
                 # В protobuf Python для optional полей флаг HasField устанавливается автоматически при установке значения
                 debug("NODE", f"Set hops_away={hops_away} for node !{packet_from:08X} (hop_start={packet.hop_start}, hop_limit={packet.hop_limit})")
-            else:
-                # Если hops_away не может быть вычислен, устанавливаем 0 (прямой сосед)
-                # Но только если поле еще не установлено
-                if not hasattr(node_info, 'hops_away') or not node_info.HasField('hops_away'):
-                    node_info.hops_away = 0
+            # ВАЖНО: Если условие не выполняется, НЕ устанавливаем hops_away (как в firmware)
+            # Это означает, что has_hops_away остается false, и клиент может показать "hops: ?"
+            # Для пакетов через MQTT с hop_start = hop_limit это даст hops_away = 0, что правильно
     
     def update_telemetry(self, node_num: int, device_metrics: Any) -> None:
         """Обновляет информацию о telemetry устройства (как в firmware NodeDB::updateTelemetry)"""
@@ -105,8 +105,8 @@ class NodeDB:
                 node_info.position = mesh_pb2.Position()
             
             # Обновляем позицию (как в firmware)
+            # В Python protobuf нет поля has_position - позиция считается установленной, если есть координаты
             node_info.position.CopyFrom(position)
-            node_info.has_position = True
             
             debug("NODE", f"Updated position for node !{node_num:08X}: lat={position.latitude_i}, lon={position.longitude_i}")
         except Exception as e:

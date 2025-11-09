@@ -29,7 +29,7 @@ except ImportError:
 from ..config import MAX_NUM_CHANNELS, DEFAULT_HOP_LIMIT
 from ..mesh.channels import Channels
 from ..mesh.node_db import NodeDB
-from ..mesh.config_storage import ConfigStorage, NodeConfig
+from ..mesh.config_storage import ConfigStorage, NodeConfig, normalize_firmware_version
 from ..mesh.persistence import Persistence
 from ..mesh.rtc import RTC, RTCQuality, RTCSetResult, get_valid_time
 from ..mqtt.client import MQTTClient
@@ -426,6 +426,53 @@ class TCPConnectionSession:
         """Возвращает uptime в секундах для этой сессии"""
         return int(time.time() - self.created_at)
     
+    def _send_telemetry_keepalive(self) -> None:
+        """
+        Отправляет телеметрию через TCP для поддержания активности соединения
+        (Android клиент закрывает соединение после 90 секунд неактивности)
+        """
+        try:
+            from meshtastic.protobuf import telemetry_pb2, portnums_pb2, mesh_pb2
+            from ..config import DEFAULT_HOP_LIMIT
+            import random
+            
+            if not telemetry_pb2:
+                return
+            
+            # Получаем телеметрию из NodeDB
+            our_node = self.node_db.get_or_create_mesh_node(self.node_num)
+            if not hasattr(our_node, 'device_metrics') or not our_node.HasField('device_metrics'):
+                return
+            
+            # Обновляем uptime_seconds
+            our_node.device_metrics.uptime_seconds = self.get_uptime_seconds()
+            
+            # Создаем Telemetry пакет
+            telemetry = telemetry_pb2.Telemetry()
+            telemetry.time = int(time.time())
+            telemetry.device_metrics.CopyFrom(our_node.device_metrics)
+            
+            # Создаем MeshPacket с Telemetry payload
+            packet = mesh_pb2.MeshPacket()
+            packet.id = random.randint(1, 0xFFFFFFFF)
+            packet.to = 0xFFFFFFFF  # Broadcast
+            setattr(packet, 'from', self.node_num)
+            packet.channel = 0
+            packet.decoded.portnum = portnums_pb2.PortNum.TELEMETRY_APP
+            packet.decoded.payload = telemetry.SerializeToString()
+            packet.hop_limit = DEFAULT_HOP_LIMIT
+            packet.hop_start = DEFAULT_HOP_LIMIT
+            packet.want_ack = False
+            
+            # Отправляем через TCP (FromRadio.packet)
+            from_radio = mesh_pb2.FromRadio()
+            from_radio.packet.CopyFrom(packet)
+            self._send_from_radio(from_radio)
+            
+            debug("TCP", f"[{self._log_prefix()}] Sent telemetry keepalive (uptime={our_node.device_metrics.uptime_seconds}s)")
+        except Exception as e:
+            debug("TCP", f"[{self._log_prefix()}] Error sending telemetry keepalive: {e}")
+    
     def _alloc_position_packet(self, channel_index: int = 0) -> Optional[mesh_pb2.MeshPacket]:
         """
         Создает пакет с позицией (как в firmware PositionModule::allocPositionPacket)
@@ -488,8 +535,8 @@ class TCPConnectionSession:
                 p.longitude_i = position.longitude_i
             
             p.precision_bits = precision
-            p.has_latitude_i = True
-            p.has_longitude_i = True
+            # В Python protobuf нет полей has_* - установка значения автоматически означает, что поле установлено
+            # (поля latitude_i и longitude_i помечены как optional в protobuf)
             
             # Время (всегда включается, если доступно)
             from ..mesh.rtc import RTCQuality, get_valid_time
@@ -512,16 +559,13 @@ class TCPConnectionSession:
                 if pos_flags & 0x0002:  # ALTITUDE_MSL
                     if hasattr(position, 'altitude'):
                         p.altitude = position.altitude
-                        p.has_altitude = True
                 else:
                     if hasattr(position, 'altitude_hae'):
                         p.altitude_hae = position.altitude_hae
-                        p.has_altitude_hae = True
                 
                 if pos_flags & 0x0004:  # GEOIDAL_SEPARATION
                     if hasattr(position, 'altitude_geoidal_separation'):
                         p.altitude_geoidal_separation = position.altitude_geoidal_separation
-                        p.has_altitude_geoidal_separation = True
             
             if pos_flags & 0x0008:  # DOP
                 if pos_flags & 0x0010:  # HVDOP
@@ -548,12 +592,10 @@ class TCPConnectionSession:
             if pos_flags & 0x0100:  # HEADING
                 if hasattr(position, 'ground_track'):
                     p.ground_track = position.ground_track
-                    p.has_ground_track = True
             
             if pos_flags & 0x0200:  # SPEED
                 if hasattr(position, 'ground_speed'):
                     p.ground_speed = position.ground_speed
-                    p.has_ground_speed = True
             
             # Создаем MeshPacket
             import random
@@ -698,8 +740,14 @@ class TCPConnectionSession:
             sent = self.client_socket.send(framed)
             if sent != len(framed):
                 warn("TCP", f"[{self._log_prefix()}] Sent only {sent} of {len(framed)} bytes")
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            # Критические ошибки TCP - пробрасываем наверх, чтобы закрыть соединение
+            # (как в firmware - разрыв TCP должен закрыть сессию)
+            error("TCP", f"[{self._log_prefix()}] TCP connection broken while sending FromRadio: {e}")
+            raise
         except Exception as e:
-            error("TCP", f"[{self._log_prefix()}] Error sending FromRadio: {e}")
+            # Другие ошибки (не разрыв TCP) - логируем, но не закрываем соединение
+            error("TCP", f"[{self._log_prefix()}] Error sending FromRadio (non-critical): {e}")
             import traceback
             traceback.print_exc()
     
@@ -771,8 +819,12 @@ class TCPConnectionSession:
             elif to_radio.HasField('packet'):
                 debug("TCP", f"[{self._log_prefix()}] ToRadio contains MeshPacket")
                 self._handle_mesh_packet(to_radio.packet)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # Критические ошибки TCP - пробрасываем наверх, чтобы закрыть соединение
+            raise
         except Exception as e:
-            error("TCP", f"[{self._log_prefix()}] Error processing ToRadio: {e}")
+            # Другие ошибки (не разрыв TCP) - логируем, но не закрываем соединение
+            error("TCP", f"[{self._log_prefix()}] Error processing ToRadio (non-critical): {e}")
             import traceback
             traceback.print_exc()
     
@@ -794,7 +846,13 @@ class TCPConnectionSession:
                 debug("TCP", f"[{self._log_prefix()}] Route trace: hops_away={hops_away}, hop_start={hop_start}, hop_limit={hop_limit}")
             
             packet_to = packet.to
-            debug("TCP", f"[{self._log_prefix()}] Received MeshPacket: payload_variant={payload_type}, id={packet.id}, from={packet_from:08X}, to={packet_to:08X}, channel={packet.channel}, want_ack={want_ack}, hop_limit={hop_limit}, hop_start={hop_start}, hops_away={hops_away}")
+            # Логируем portnum для decoded пакетов
+            portnum_info = ""
+            if payload_type == "decoded" and hasattr(packet.decoded, 'portnum'):
+                portnum = packet.decoded.portnum
+                portnum_name = portnums_pb2.PortNum.Name(portnum) if portnum in portnums_pb2.PortNum.values() else f"UNKNOWN({portnum})"
+                portnum_info = f", portnum={portnum_name}({portnum})"
+            debug("TCP", f"[{self._log_prefix()}] Received MeshPacket: payload_variant={payload_type}, id={packet.id}, from={packet_from:08X}, to={packet_to:08X}, channel={packet.channel}, want_ack={want_ack}, hop_limit={hop_limit}, hop_start={hop_start}, hops_away={hops_away}{portnum_info}")
             
             # Используем PacketHandler для проверки Admin пакета
             if PacketHandler.is_admin_packet(packet):
@@ -821,6 +879,7 @@ class TCPConnectionSession:
             # Обработка пакетов позиции от клиента (как в firmware PositionModule::handleReceivedProtobuf)
             # Android клиент отправляет позицию из GPS через POSITION_APP пакет
             if hasattr(packet.decoded, 'portnum') and packet.decoded.portnum == portnums_pb2.PortNum.POSITION_APP:
+                info("POSITION", f"[{self._log_prefix()}] 🔍️ Received POSITION_APP packet from client (id={packet.id})")
                 try:
                     position = mesh_pb2.Position()
                     position.ParseFromString(packet.decoded.payload)
@@ -828,11 +887,13 @@ class TCPConnectionSession:
                     # Если fixed_position не установлен, обновляем позицию (как в Android: if (!localConfig.position.fixedPosition))
                     if not self.config_storage.config.position.fixed_position:
                         self.node_db.update_position(self.node_num, position)
-                        debug("POSITION", f"[{self._log_prefix()}] Updated position from client GPS: lat={position.latitude_i}, lon={position.longitude_i}")
+                        info("POSITION", f"[{self._log_prefix()}] ✅ Updated position from client GPS: lat={position.latitude_i} ({position.latitude_i * 1e-7:.6f}°), lon={position.longitude_i} ({position.longitude_i * 1e-7:.6f}°), location_source={mesh_pb2.Position.LocSource.Name(position.location_source) if hasattr(position, 'location_source') else 'N/A'}")
                     else:
                         debug("POSITION", f"[{self._log_prefix()}] Ignoring position update from client (fixed_position is enabled)")
                 except Exception as e:
-                    debug("POSITION", f"[{self._log_prefix()}] Error parsing position from client: {e}")
+                    error("POSITION", f"[{self._log_prefix()}] ❌ Error parsing position from client: {e}")
+                    import traceback
+                    traceback.print_exc()
             
             if self.mqtt_client:
                 self.mqtt_client.publish_packet(packet, channel_index)
@@ -907,8 +968,12 @@ class TCPConnectionSession:
                         self.node_db.update_position(packet_from, position)
                     except Exception as e:
                         error("NODE", f"[{self._log_prefix()}] Error updating position: {e}")
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # Критические ошибки TCP - пробрасываем наверх, чтобы закрыть соединение
+            raise
         except Exception as e:
-            error("MQTT", f"[{self._log_prefix()}] Error processing MeshPacket from MQTT: {e}")
+            # Другие ошибки (не разрыв TCP) - логируем, но не закрываем соединение
+            error("MQTT", f"[{self._log_prefix()}] Error processing MeshPacket (non-critical): {e}")
             import traceback
             traceback.print_exc()
     
@@ -1221,11 +1286,15 @@ class TCPConnectionSession:
                 device_metadata = mesh_pb2.DeviceMetadata()
                 # ВАЖНО: Убеждаемся, что версия прошивки всегда установлена и не пустая
                 # (клиент проверяет версию и требует обновление, если версия меньше минимальной или пустая)
+                # Версия уже нормализована в NodeConfig, но дополнительно проверяем
                 firmware_version = NodeConfig.FIRMWARE_VERSION
                 if not firmware_version or firmware_version.strip() == "":
                     # Если версия не установлена, используем дефолтную (достаточно новую)
-                    firmware_version = "2.6.11"
+                    firmware_version = "2.7.0"
                     warn("ADMIN", f"[{self._log_prefix()}] Firmware version not set, using default: {firmware_version}")
+                else:
+                    # Дополнительная нормализация на случай, если версия была изменена напрямую
+                    firmware_version = normalize_firmware_version(firmware_version)
                 device_metadata.firmware_version = firmware_version
                 debug("ADMIN", f"[{self._log_prefix()}] Sending DeviceMetadata with firmware_version: {firmware_version}")
                 device_metadata.device_state_version = 1
@@ -1355,13 +1424,22 @@ class TCPConnectionSession:
         """Закрывает сессию и очищает ресурсы"""
         # Защита от повторного закрытия
         if self._closed:
+            debug("SESSION", f"[{self._log_prefix()}] Session already closed, skipping")
             return
+        
+        # Логируем причину закрытия (для диагностики)
+        import traceback
+        import sys
+        # Получаем стек вызовов, чтобы понять, откуда вызывается close()
+        stack = ''.join(traceback.format_stack()[-3:-1])  # Последние 2 уровня стека
+        debug("SESSION", f"[{self._log_prefix()}] Closing session, called from:\n{stack}")
         
         self._closed = True
         
         # Останавливаем MQTT клиент ПЕРЕД закрытием сокета
         if self.mqtt_client:
             try:
+                debug("SESSION", f"[{self._log_prefix()}] Stopping MQTT client before closing session")
                 self.mqtt_client.stop()
             except Exception as e:
                 warn("SESSION", f"[{self._log_prefix()}] Error stopping MQTT client: {e}")

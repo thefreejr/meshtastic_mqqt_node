@@ -240,6 +240,18 @@ class MQTTConnection:
             debug("MQTT", f"DisconnectFlags received (not an error, ignoring): {properties}")
             return
         
+        # ВАЖНО: Проверяем, действительно ли соединение разорвано
+        # paho-mqtt v2 может вызывать _on_disconnect даже при успешном подключении
+        # Проверяем состояние клиента перед обработкой отключения
+        is_really_disconnected = self._is_really_disconnected()
+        
+        # Если соединение все еще активно, игнорируем этот вызов
+        if not is_really_disconnected:
+            with self._connected_lock:
+                if self.connected:
+                    debug("MQTT", "on_disconnect called but connection is still active, ignoring")
+                    return
+        
         # Только если это реальное отключение, устанавливаем флаг
         with self._connected_lock:
             self.connected = False
@@ -266,7 +278,18 @@ class MQTTConnection:
         if result_code is None:
             debug("MQTT", "Disconnected from broker (reason code not provided)")
         elif result_code == 0 or (isinstance(result_code, int) and result_code == 0):
-            info("MQTT", "Disconnected from broker (normal disconnect)")
+            # Normal disconnection (код 0) - это нормальное отключение, которое может происходить:
+            # 1. При явном вызове disconnect() (например, при закрытии TCP сессии)
+            # 2. При переподключении (старое соединение закрывается)
+            # 3. При изменении конфигурации MQTT
+            # ВАЖНО: Если это нормальное отключение и auto_reconnect не остановлен,
+            # это может быть переподключение - не логируем как ошибку
+            if self._reconnect_stop:
+                # Это явное отключение (например, при закрытии TCP сессии)
+                debug("MQTT", "Disconnected from broker (normal disconnect, reconnect stopped)")
+            else:
+                # Это может быть переподключение - логируем как info
+                info("MQTT", "Disconnected from broker (normal disconnect, may reconnect)")
         else:
             error_msg = self._get_error_message(result_code)
             warn("MQTT", f"Disconnected from broker: {error_msg} (code: {result_code})")
@@ -276,7 +299,10 @@ class MQTTConnection:
         # Запускаем переподключение в отдельном потоке, чтобы не блокировать callback
         # ВАЖНО: Проверяем флаг ДО запуска auto-reconnect, так как он может быть установлен в _on_connect
         # (который вызывается перед _on_disconnect при ошибке подключения)
-        if self.auto_reconnect and not self._reconnect_stop and not self._auth_failed:
+        # ВАЖНО: Не запускаем auto-reconnect, если соединение все еще активно (ложный вызов)
+        # ВАЖНО: Не запускаем auto-reconnect, если это нормальное отключение и reconnect_stop установлен
+        # (это означает, что отключение было запрошено явно, например, при закрытии TCP сессии)
+        if self.auto_reconnect and not self._reconnect_stop and not self._auth_failed and is_really_disconnected:
             # Дополнительная проверка: если это была ошибка авторизации, не запускаем auto-reconnect
             # (флаг уже должен быть установлен в _on_connect, но проверяем на всякий случай)
             if result_code is not None:
@@ -351,6 +377,51 @@ class MQTTConnection:
                 if self._reconnect_stop or self._auth_failed:
                     break
                 time.sleep(0.1)
+    
+    def _is_really_disconnected(self) -> bool:
+        """Проверяет, действительно ли соединение разорвано"""
+        if not self.client:
+            # Если клиента нет, значит точно отключен
+            return True
+        
+        try:
+            # В paho-mqtt v2 есть метод is_connected()
+            if hasattr(self.client, 'is_connected'):
+                return not self.client.is_connected()
+            # Если метода нет, проверяем по другим признакам
+            elif hasattr(self.client, '_sock'):
+                return self.client._sock is None
+            # Если и этого нет, проверяем наш внутренний флаг
+            else:
+                with self._connected_lock:
+                    return not self.connected
+        except Exception as e:
+            debug("MQTT", f"Error checking connection status: {e}")
+            # В случае ошибки проверяем наш внутренний флаг
+            with self._connected_lock:
+                return not self.connected
+    
+    def is_connected(self) -> bool:
+        """Проверяет, подключен ли клиент"""
+        if not self.client:
+            return False
+        
+        try:
+            # В paho-mqtt v2 есть метод is_connected()
+            if hasattr(self.client, 'is_connected'):
+                return self.client.is_connected()
+            # Если метода нет, проверяем по другим признакам
+            elif hasattr(self.client, '_sock'):
+                return self.client._sock is not None
+            # Если и этого нет, проверяем наш внутренний флаг
+            else:
+                with self._connected_lock:
+                    return self.connected
+        except Exception as e:
+            debug("MQTT", f"Error checking connection status: {e}")
+            # В случае ошибки проверяем наш внутренний флаг
+            with self._connected_lock:
+                return self.connected
     
     def _get_error_message(self, code: Any) -> str:
         """Возвращает текстовое описание ошибки MQTT"""
@@ -451,7 +522,9 @@ class MQTTConnection:
     
     def disconnect(self) -> None:
         """Отключается от MQTT брокера"""
-        # Останавливаем автоматическое переподключение
+        # ВАЖНО: Устанавливаем флаг ПЕРЕД отключением, чтобы _on_disconnect знал,
+        # что это явное отключение (например, при закрытии TCP сессии)
+        # и не запускал auto-reconnect
         self._reconnect_stop = True
         
         # Ожидаем завершения потока переподключения с увеличенным timeout

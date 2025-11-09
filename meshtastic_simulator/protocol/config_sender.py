@@ -89,10 +89,16 @@ class ConfigSender:
         # 4. Channels
         self._send_channels()
         
-        # 5. Other NodeInfos
+        # 5. Config sections
+        self._send_config_sections()
+        
+        # 6. ModuleConfig sections
+        self._send_module_config_sections()
+        
+        # 7. Other NodeInfos
         self._send_other_nodes()
         
-        # 6. Config complete
+        # 8. Config complete
         self._send_config_complete(config_nonce)
     
     def _send_my_info(self) -> None:
@@ -229,6 +235,61 @@ class ConfigSender:
             from_radio = mesh_pb2.FromRadio()
             from_radio.channel.CopyFrom(channel)
             self.send_from_radio(from_radio)
+    
+    def _send_config_sections(self) -> None:
+        """Отправляет все секции Config (как в firmware PhoneAPI.cpp:304-368)"""
+        from meshtastic.protobuf import admin_pb2, config_pb2
+        
+        # Отправляем все типы Config секций
+        config_types = [
+            admin_pb2.AdminMessage.ConfigType.DEVICE_CONFIG,
+            admin_pb2.AdminMessage.ConfigType.POSITION_CONFIG,
+            admin_pb2.AdminMessage.ConfigType.POWER_CONFIG,
+            admin_pb2.AdminMessage.ConfigType.NETWORK_CONFIG,
+            admin_pb2.AdminMessage.ConfigType.DISPLAY_CONFIG,
+            admin_pb2.AdminMessage.ConfigType.LORA_CONFIG,
+            admin_pb2.AdminMessage.ConfigType.BLUETOOTH_CONFIG,
+            admin_pb2.AdminMessage.ConfigType.SECURITY_CONFIG,
+            admin_pb2.AdminMessage.ConfigType.SESSIONKEY_CONFIG,
+            admin_pb2.AdminMessage.ConfigType.DEVICEUI_CONFIG,
+        ]
+        
+        for config_type in config_types:
+            config = self.config_storage.get_config(config_type)
+            if config:
+                from_radio = mesh_pb2.FromRadio()
+                from_radio.config.CopyFrom(config)
+                self.send_from_radio(from_radio)
+                debug("CONFIG", f"Sent Config section: {config_type}")
+    
+    def _send_module_config_sections(self) -> None:
+        """Отправляет все секции ModuleConfig (как в firmware PhoneAPI.cpp:370-456)"""
+        from meshtastic.protobuf import admin_pb2, module_config_pb2
+        
+        # Отправляем все типы ModuleConfig секций
+        module_config_types = [
+            admin_pb2.AdminMessage.ModuleConfigType.MQTT_CONFIG,
+            admin_pb2.AdminMessage.ModuleConfigType.SERIAL_CONFIG,
+            admin_pb2.AdminMessage.ModuleConfigType.EXTNOTIF_CONFIG,
+            admin_pb2.AdminMessage.ModuleConfigType.STOREFORWARD_CONFIG,
+            admin_pb2.AdminMessage.ModuleConfigType.RANGETEST_CONFIG,
+            admin_pb2.AdminMessage.ModuleConfigType.TELEMETRY_CONFIG,
+            admin_pb2.AdminMessage.ModuleConfigType.CANNEDMSG_CONFIG,
+            admin_pb2.AdminMessage.ModuleConfigType.AUDIO_CONFIG,
+            admin_pb2.AdminMessage.ModuleConfigType.REMOTEHARDWARE_CONFIG,
+            admin_pb2.AdminMessage.ModuleConfigType.NEIGHBORINFO_CONFIG,
+            admin_pb2.AdminMessage.ModuleConfigType.AMBIENTLIGHTING_CONFIG,
+            admin_pb2.AdminMessage.ModuleConfigType.DETECTIONSENSOR_CONFIG,
+            admin_pb2.AdminMessage.ModuleConfigType.PAXCOUNTER_CONFIG,
+        ]
+        
+        for module_config_type in module_config_types:
+            module_config = self.config_storage.get_module_config(module_config_type)
+            if module_config:
+                from_radio = mesh_pb2.FromRadio()
+                from_radio.moduleConfig.CopyFrom(module_config)
+                self.send_from_radio(from_radio)
+                debug("CONFIG", f"Sent ModuleConfig section: {module_config_type}")
     
     def _send_other_nodes(self) -> None:
         """Отправляет информацию о других узлах"""

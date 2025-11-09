@@ -86,7 +86,7 @@ class ConfigLoader:
                 'user_short_name': 'MQTT',
                 'hw_model': 'PORTDUINO',
                 'device_metrics': {'battery_level': 101, 'voltage': 5.0, 'channel_utilization': 0.0, 'air_util_tx': 0.0},
-                'firmware_version': '2.6.11.60ec05e',
+                'firmware_version': '2.7.0',
                 'fallback_node_num': 0x12345678
             }
         }

@@ -26,6 +26,39 @@ def _get_config_value(path: str, default: Any) -> Any:
     return _config_loader.get_value(path, default)
 
 
+def normalize_firmware_version(version: str) -> str:
+    """
+    Нормализует версию прошивки, убирая суффиксы и проверяя формат X.Y.Z
+    
+    Args:
+        version: Версия прошивки (может содержать суффиксы типа .60ec05e)
+        
+    Returns:
+        Нормализованная версия в формате X.Y.Z
+    """
+    if not version or not version.strip():
+        return "2.7.0"
+    
+    version = version.strip()
+    
+    # Убираем суффиксы после точки (например, "2.6.11.60ec05e" -> "2.6.11")
+    # Ищем паттерн X.Y.Z и останавливаемся на третьей цифре после точки
+    import re
+    match = re.match(r'^(\d+\.\d+\.\d+)', version)
+    if match:
+        normalized = match.group(1)
+        # Проверяем, что версия не слишком старая (минимум 2.5.14)
+        parts = [int(x) for x in normalized.split('.')]
+        if len(parts) == 3:
+            # Если версия меньше 2.5.14, используем дефолтную 2.7.0
+            if (parts[0] < 2) or (parts[0] == 2 and parts[1] < 5) or (parts[0] == 2 and parts[1] == 5 and parts[2] < 14):
+                return "2.7.0"
+        return normalized
+    
+    # Если формат не распознан, возвращаем дефолтную версию
+    return "2.7.0"
+
+
 class NodeConfig:
     """Статические настройки узла для отправки клиенту (из config/project.yaml)"""
     
@@ -43,7 +76,12 @@ class NodeConfig:
     DEVICE_METRICS_AIR_UTIL_TX = _get_config_value('node.device_metrics.air_util_tx', 0.0)
     
     # Metadata
-    FIRMWARE_VERSION = _get_config_value('node.firmware_version', "2.6.11.60ec05e")
+    # ВАЖНО: Версия должна быть в формате X.Y.Z (без суффиксов), чтобы клиент мог правильно парсить
+    # Минимальная версия для Android клиента: 2.5.14, абсолютный минимум: 2.3.15
+    # Используем версию 2.7.0, которая выше минимальной и соответствует формату парсинга
+    # Версия нормализуется автоматически (убираются суффиксы)
+    _raw_firmware_version = _get_config_value('node.firmware_version', "2.7.0")
+    FIRMWARE_VERSION = normalize_firmware_version(_raw_firmware_version)
     
     # Fallback node_num
     FALLBACK_NODE_NUM = _get_config_value('node.fallback_node_num', 0x12345678)
@@ -89,6 +127,14 @@ class ConfigStorage:
             response.position.CopyFrom(self.config.position)
         elif config_type == admin_pb2.AdminMessage.ConfigType.POWER_CONFIG:
             response.power.CopyFrom(self.config.power)
+            # ВАЖНО: Устанавливаем ls_secs явно (как в firmware PhoneAPI.cpp:321)
+            # Это нужно для совместимости со старыми клиентами
+            # Даже если внутри используется 0 для "use default", нужно отправить реальное значение
+            # В firmware всегда устанавливается default_ls_secs, даже если значение уже есть
+            # Используем значение по умолчанию (5 минут для обычного устройства, не роутера)
+            default_ls_secs = 5 * 60
+            if response.power.ls_secs == 0:
+                response.power.ls_secs = default_ls_secs
         elif config_type == admin_pb2.AdminMessage.ConfigType.NETWORK_CONFIG:
             response.network.CopyFrom(self.config.network)
         elif config_type == admin_pb2.AdminMessage.ConfigType.DISPLAY_CONFIG:
@@ -101,10 +147,20 @@ class ConfigStorage:
             response.security.CopyFrom(self.config.security)
         elif config_type == admin_pb2.AdminMessage.ConfigType.SESSIONKEY_CONFIG:
             # SessionKey config - пустой (как в firmware)
-            response.session_key.CopyFrom(self.config.session_key)
+            if self.config.HasField('sessionkey'):
+                response.sessionkey.CopyFrom(self.config.sessionkey)
+            else:
+                # Создаем пустой объект, если его нет
+                response.sessionkey.CopyFrom(config_pb2.Config.SessionkeyConfig())
         elif config_type == admin_pb2.AdminMessage.ConfigType.DEVICEUI_CONFIG:
-            # DeviceUI config - пустой (как в firmware)
-            response.device_ui.CopyFrom(self.config.device_ui)
+            # DeviceUI config - пустой NOOP (как в firmware PhoneAPI.cpp:352-354)
+            # Только устанавливаем which_payload_variant, без копирования содержимого
+            if self.config.HasField('device_ui'):
+                response.device_ui.CopyFrom(self.config.device_ui)
+            else:
+                # Создаем пустой объект, если его нет
+                from meshtastic.protobuf import device_ui_pb2
+                response.device_ui.CopyFrom(device_ui_pb2.DeviceUIConfig())
         else:
             return None
         
