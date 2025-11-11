@@ -853,12 +853,25 @@ class MQTTPacketProcessor:
                         
                         if receiver_session and receiver_session.mqtt_client and receiver_session.mqtt_client.connected:
                             channel_index = packet.channel if packet.channel < 8 else 0
-                            receiver_session.mqtt_client.publish_packet(ack_packet, channel_index)
+                            
+                            # ВАЖНО: Детальное логирование для диагностики статуса доставки
+                            # Android клиент устанавливает статус "доставка подтверждена" только если:
+                            # fromId == p?.data?.to, где fromId = packet.from из ACK, p?.data?.to = to исходного пакета
+                            ack_from = getattr(ack_packet, 'from', 0)
+                            ack_to = ack_packet.to
                             want_ack_info = f", want_ack={ack_wants_ack}" if ack_wants_ack else ""
+                            
+                            # Проверяем, правильно ли установлены поля для статуса "доставка подтверждена"
+                            # Для прямых сообщений: ack_from (получатель) должен быть равен packet_to (получатель)
+                            will_be_received = (ack_error is None and ack_from == packet_to)
+                            status_info = " (will be RECEIVED)" if will_be_received else " (will be DELIVERED)"
+                            
                             if ack_error is None:
-                                info("ACK", f"Sent ACK via MQTT for packet {packet.id} from !{packet_from:08X} to !{packet_to:08X} (request_id={ack_packet.decoded.request_id}{want_ack_info})")
+                                info("ACK", f"✅ Sent ACK via MQTT: packet_id={packet.id}, request_id={ack_packet.decoded.request_id}, ack_from=!{ack_from:08X}, ack_to=!{ack_to:08X}, original_from=!{packet_from:08X}, original_to=!{packet_to:08X}{status_info}{want_ack_info}")
                             else:
-                                info("ACK", f"Sent NAK via MQTT for packet {packet.id} from !{packet_from:08X} to !{packet_to:08X} (error={ack_error}, request_id={ack_packet.decoded.request_id})")
+                                info("ACK", f"❌ Sent NAK via MQTT: packet_id={packet.id}, request_id={ack_packet.decoded.request_id}, error={ack_error}, ack_from=!{ack_from:08X}, ack_to=!{ack_to:08X}, original_from=!{packet_from:08X}, original_to=!{packet_to:08X}")
+                            
+                            receiver_session.mqtt_client.publish_packet(ack_packet, channel_index)
                         else:
                             debug("ACK", f"Could not send ACK via MQTT: receiver_session not found or MQTT not connected")
                     except Exception as e:

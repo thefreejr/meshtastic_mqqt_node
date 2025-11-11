@@ -1193,7 +1193,17 @@ class TCPConnectionSession:
                     packet_to = packet.to
                     is_broadcast = packet_to == 0xFFFFFFFF
                     want_ack_info = f", want_ack={ack_wants_ack}" if ack_wants_ack else ""
-                    debug("ACK", f"[{self._log_prefix()}] Sent ACK (async): packet_id={ack_packet.id}, request_id={packet.id}, to={packet_from:08X}, from={self.node_num:08X}, channel={channel_index}, packet_to={packet_to:08X}, broadcast={is_broadcast}, error_reason=NONE{want_ack_info}")
+                    
+                    # ВАЖНО: Детальное логирование для диагностики статуса доставки
+                    # Android клиент устанавливает статус "доставка подтверждена" только если:
+                    # fromId == p?.data?.to, где fromId = packet.from из ACK, p?.data?.to = to исходного пакета
+                    ack_from = getattr(ack_packet, 'from', 0)
+                    ack_to = ack_packet.to
+                    # Для пакетов от клиента через TCP: ack_from (наш node_num) должен быть равен packet_to (получатель)
+                    will_be_received = (ack_from == packet_to and not is_broadcast)
+                    status_info = " (will be RECEIVED)" if will_be_received else " (will be DELIVERED)"
+                    
+                    debug("ACK", f"[{self._log_prefix()}] ✅ Sent ACK (async): packet_id={ack_packet.id}, request_id={packet.id}, ack_from={ack_from:08X}, ack_to={ack_to:08X}, original_from={packet_from:08X}, original_to={packet_to:08X}, channel={channel_index}, broadcast={is_broadcast}{status_info}{want_ack_info}")
                 except Exception as e:
                     error("ACK", f"[{self._log_prefix()}] Error sending ACK (async): {e}")
             
