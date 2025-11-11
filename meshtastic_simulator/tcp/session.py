@@ -880,6 +880,10 @@ class TCPConnectionSession:
             packet_copy_for_client = mesh_pb2.MeshPacket()
             packet_copy_for_client.CopyFrom(packet)
             
+            # ВАЖНО: Сохраняем оригинальный packet_from ДО изменения (для создания ACK)
+            # Для пакетов от клиента через TCP packet_from=0, и это нужно сохранить для ACK
+            original_packet_from = packet_from
+            
             # ВАЖНО: Проверяем, был ли отправлен response (как в firmware MeshModule::currentReply)
             # Если response был отправлен, ACK не отправляется (избежание дублирования)
             response_sent = False
@@ -980,11 +984,17 @@ class TCPConnectionSession:
                         self._send_from_radio(from_radio)
                         info("POSITION", f"[{self._log_prefix()}] Sent position reply (request_id={packet.id})")
             
+            # ВАЖНО: В firmware ACK создается только для пакетов, адресованных нам (isToUs)
+            # (как в firmware ReliableRouter::sniffReceived: if (isToUs(p)))
+            # Для пакетов, адресованных другому узлу, ACK должен прийти от получателя через MQTT
+            is_broadcast = (packet_to == 0xFFFFFFFF or packet_to == 0xFFFFFFFE)
+            is_to_us = (packet_to == self.node_num) if not is_broadcast else False
+            
             # ВАЖНО: В firmware ACK не отправляется, если модуль уже отправил response (currentReply)
             # (как в firmware ReliableRouter::sniffReceived: if (!MeshModule::currentReply))
             # Также проверяем пакеты с request_id и reply_id (как в firmware: else if (!p->decoded.request_id && !p->decoded.reply_id))
             should_send_ack = False
-            if not response_sent:  # Если response не был отправлен
+            if is_to_us and not response_sent:  # Только для пакетов, адресованных нам, и если response не был отправлен
                 if PacketHandler.should_send_ack(packet):
                     # Дополнительная проверка для пакетов с request_id или reply_id (как в firmware)
                     has_request_id = hasattr(packet.decoded, 'request_id') and packet.decoded.request_id != 0
@@ -1005,11 +1015,21 @@ class TCPConnectionSession:
                             debug("ACK", f"[{self._log_prefix()}] Direct packet with request_id/reply_id, sending 0-hop ACK")
                         else:
                             debug("ACK", f"[{self._log_prefix()}] Packet {packet.id} has request_id={has_request_id} or reply_id={has_reply_id}, skipping ACK (not direct)")
+            elif want_ack and not is_to_us and not is_broadcast:
+                # Пакет адресован другому узлу - ACK должен прийти от получателя через MQTT
+                debug("ACK", f"[{self._log_prefix()}] Packet {packet.id} addressed to another node (to={packet_to:08X}, our_node={self.node_num:08X}), ACK will come from receiver via MQTT")
             
             if should_send_ack:
                 portnum_name = packet.decoded.portnum if hasattr(packet.decoded, 'portnum') else 'N/A'
-                debug("ACK", f"[{self._log_prefix()}] Sending ACK for packet {packet.id} (portnum={portnum_name}, from={packet_from:08X})")
-                self._send_ack(packet, channel_index)
+                debug("ACK", f"[{self._log_prefix()}] Sending ACK for packet {packet.id} (portnum={portnum_name}, original_from={original_packet_from:08X})")
+                # ВАЖНО: Для пакетов от клиента через TCP нужно использовать оригинальный packet_from (0)
+                # Создаем копию пакета с оригинальным from для создания ACK
+                packet_for_ack = mesh_pb2.MeshPacket()
+                packet_for_ack.CopyFrom(packet)
+                # Восстанавливаем оригинальный from для правильного создания ACK
+                if original_packet_from == 0:
+                    setattr(packet_for_ack, 'from', 0)
+                self._send_ack(packet_for_ack, channel_index, original_packet_from=original_packet_from)
             else:
                 # Логируем, если ACK не отправляется (для диагностики)
                 if want_ack:
@@ -1197,16 +1217,34 @@ class TCPConnectionSession:
             import traceback
             traceback.print_exc()
     
-    def _send_ack(self, packet: mesh_pb2.MeshPacket, channel_index: int) -> None:
-        """Отправляет ACK пакет обратно клиенту (как в firmware ReliableRouter::sniffReceived)"""
+    def _send_ack(self, packet: mesh_pb2.MeshPacket, channel_index: int, original_packet_from: int = None) -> None:
+        """
+        Отправляет ACK пакет обратно клиенту (как в firmware ReliableRouter::sniffReceived)
+        
+        Args:
+            packet: MeshPacket для которого создается ACK (может быть с измененным from)
+            channel_index: Индекс канала
+            original_packet_from: Оригинальный from пакета (до изменения), если None - используется из packet
+        """
         try:
+            # Используем original_packet_from если передан, иначе берем из packet
+            if original_packet_from is None:
+                original_packet_from = getattr(packet, 'from', 0)
+            
             # Проверяем, нужно ли отправлять ACK с want_ack=true для надежной доставки
             # (как в firmware shouldSuccessAckWithWantAck)
             ack_wants_ack = PacketHandler.should_success_ack_with_want_ack(packet, self.node_num)
             
+            # ВАЖНО: Для пакетов от клиента через TCP (original_packet_from=0) используем оригинальный from
+            # Создаем временную копию пакета с оригинальным from для создания ACK
+            packet_for_ack = mesh_pb2.MeshPacket()
+            packet_for_ack.CopyFrom(packet)
+            if original_packet_from == 0:
+                setattr(packet_for_ack, 'from', 0)
+            
             # Используем PacketHandler для создания ACK пакета
             ack_packet = PacketHandler.create_ack_packet(
-                packet, 
+                packet_for_ack, 
                 self.node_num, 
                 channel_index,
                 error_reason=None,
@@ -1219,7 +1257,6 @@ class TCPConnectionSession:
                     from_radio = mesh_pb2.FromRadio()
                     from_radio.packet.CopyFrom(ack_packet)
                     self._send_from_radio(from_radio)
-                    packet_from = getattr(packet, 'from', 0)
                     packet_to = packet.to
                     is_broadcast = packet_to == 0xFFFFFFFF
                     want_ack_info = f", want_ack={ack_wants_ack}" if ack_wants_ack else ""
@@ -1230,10 +1267,11 @@ class TCPConnectionSession:
                     ack_from = getattr(ack_packet, 'from', 0)
                     ack_to = ack_packet.to
                     # Для пакетов от клиента через TCP: ack_from (наш node_num) должен быть равен packet_to (получатель)
+                    # Для пакетов через MQTT: ack_from (получатель исходного пакета) должен быть равен packet_to (получатель)
                     will_be_received = (ack_from == packet_to and not is_broadcast)
                     status_info = " (will be RECEIVED)" if will_be_received else " (will be DELIVERED)"
                     
-                    debug("ACK", f"[{self._log_prefix()}] ✅ Sent ACK (async): packet_id={ack_packet.id}, request_id={packet.id}, ack_from={ack_from:08X}, ack_to={ack_to:08X}, original_from={packet_from:08X}, original_to={packet_to:08X}, channel={channel_index}, broadcast={is_broadcast}{status_info}{want_ack_info}")
+                    debug("ACK", f"[{self._log_prefix()}] ✅ Sent ACK (async): packet_id={ack_packet.id}, request_id={packet.id}, ack_from={ack_from:08X}, ack_to={ack_to:08X}, original_from={original_packet_from:08X}, original_to={packet_to:08X}, channel={channel_index}, broadcast={is_broadcast}{status_info}{want_ack_info}")
                 except Exception as e:
                     error("ACK", f"[{self._log_prefix()}] Error sending ACK (async): {e}")
             

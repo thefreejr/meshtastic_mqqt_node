@@ -22,6 +22,9 @@ class LogLevel(IntEnum):
 class Logger:
     """Класс для логирования с поддержкой уровней и фильтрации категорий"""
     
+    # Максимальный размер лог-файла (10 МБ)
+    MAX_LOG_FILE_SIZE = 10 * 1024 * 1024  # 10 МБ в байтах
+    
     def __init__(self, level: LogLevel = LogLevel.INFO, categories: Optional[List[str]] = None, log_file: Optional[str] = None) -> None:
         self.level = level
         self.categories = categories  # None = все категории, список = только разрешённые
@@ -59,6 +62,42 @@ class Logger:
                 pass
             self.log_file_handle = None
     
+    def _rotate_log_if_needed(self) -> None:
+        """Проверяет размер лог-файла и выполняет ротацию при необходимости"""
+        if not self.log_file:
+            return
+        
+        try:
+            log_path = Path(self.log_file)
+            if not log_path.exists():
+                return
+            
+            # Проверяем размер файла
+            file_size = log_path.stat().st_size
+            if file_size >= self.MAX_LOG_FILE_SIZE:
+                # Закрываем текущий файл
+                self._close_log_file()
+                
+                # Создаем имя для архивированного файла с timestamp
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                log_dir = log_path.parent
+                log_name = log_path.stem
+                log_ext = log_path.suffix
+                archived_name = f"{log_name}_{timestamp}{log_ext}"
+                archived_path = log_dir / archived_name
+                
+                # Переименовываем текущий файл
+                log_path.rename(archived_path)
+                
+                # Открываем новый файл
+                self._open_log_file()
+                
+                # Логируем информацию о ротации (только в stdout, чтобы не создавать цикл)
+                print(f"📦 Log file rotated: {archived_name} ({file_size / 1024 / 1024:.2f} MB)", file=sys.stdout)
+        except Exception as e:
+            # Если ошибка при ротации, просто выводим предупреждение
+            print(f"⚠️  Error rotating log file: {e}", file=sys.stderr)
+    
     def _should_log(self, level: LogLevel, category: str) -> bool:
         """Проверяет, нужно ли логировать сообщение данного уровня и категории"""
         # Проверяем уровень логирования
@@ -88,8 +127,16 @@ class Logger:
         # Записываем в файл если указан
         if self.log_file_handle:
             try:
-                self.log_file_handle.write(log_message + '\n')
-                self.log_file_handle.flush()
+                # Проверяем размер файла и выполняем ротацию при необходимости
+                self._rotate_log_if_needed()
+                
+                # Если файл был закрыт при ротации, открываем его снова
+                if not self.log_file_handle and self.log_file:
+                    self._open_log_file()
+                
+                if self.log_file_handle:
+                    self.log_file_handle.write(log_message + '\n')
+                    self.log_file_handle.flush()
             except Exception as e:
                 # Если ошибка записи в файл, выводим предупреждение один раз
                 if not hasattr(self, '_file_error_logged'):
