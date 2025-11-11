@@ -6,6 +6,7 @@ import socket
 import time
 import random
 import threading
+import queue
 from datetime import datetime
 from typing import Optional, Tuple
 
@@ -17,7 +18,7 @@ except ImportError:
 
 try:
     from meshtastic import mesh_pb2
-    from meshtastic.protobuf import admin_pb2, portnums_pb2, config_pb2
+    from meshtastic.protobuf import admin_pb2, portnums_pb2, config_pb2, channel_pb2
     try:
         from meshtastic.protobuf import telemetry_pb2
     except ImportError:
@@ -852,7 +853,32 @@ class TCPConnectionSession:
                 portnum = packet.decoded.portnum
                 portnum_name = portnums_pb2.PortNum.Name(portnum) if portnum in portnums_pb2.PortNum.values() else f"UNKNOWN({portnum})"
                 portnum_info = f", portnum={portnum_name}({portnum})"
+            
+            # ВАЖНО: Детальное логирование для POSITION_APP пакетов для диагностики
+            is_position_app = (payload_type == "decoded" and 
+                              hasattr(packet.decoded, 'portnum') and 
+                              packet.decoded.portnum == portnums_pb2.PortNum.POSITION_APP)
+            if is_position_app:
+                info("POSITION", f"[{self._log_prefix()}] 🔍 POSITION_APP packet received: id={packet.id}, from={packet_from:08X}, to={packet_to:08X}, node_num={self.node_num:08X}, want_ack={want_ack}, channel={packet.channel}")
+            
             debug("TCP", f"[{self._log_prefix()}] Received MeshPacket: payload_variant={payload_type}, id={packet.id}, from={packet_from:08X}, to={packet_to:08X}, channel={packet.channel}, want_ack={want_ack}, hop_limit={hop_limit}, hop_start={hop_start}, hops_away={hops_away}{portnum_info}")
+            
+            # ВАЖНО: В firmware порядок такой:
+            # 1. handleToRadio получает пакет от клиента
+            # 2. handleToRadio устанавливает from=0, rx_time, id
+            # 3. handleToRadio вызывает sendToMesh(a, RX_SRC_USER)
+            # 4. sendToMesh вызывает nodeDB->updateFrom(*p) - обновляет NodeDB
+            # 5. sendToMesh вызывает router->sendLocal(p, RX_SRC_USER)
+            # 6. Если isToUs, sendLocal вызывает enqueueReceivedMessage(p)
+            # 7. Пакет обрабатывается через handleReceived → handleFromRadio
+            # 8. handleFromRadio вызывает sendToPhone() - отправляет пакет клиенту
+            #
+            # ВАЖНО: Для пакетов от клиента с to=node_num, они обрабатываются через enqueueReceivedMessage
+            # и отправляются клиенту через handleFromRadio → sendToPhone
+            #
+            # Создаем копию пакета для отправки клиенту (как в firmware sendToPhone)
+            packet_copy_for_client = mesh_pb2.MeshPacket()
+            packet_copy_for_client.CopyFrom(packet)
             
             # Используем PacketHandler для проверки Admin пакета
             if PacketHandler.is_admin_packet(packet):
@@ -864,6 +890,8 @@ class TCPConnectionSession:
             # ВАЖНО: Пакеты от клиента всегда имеют from=0, устанавливаем на наш node_num
             if packet_from == 0:
                 setattr(packet, 'from', self.node_num)
+                # Также устанавливаем в копии для клиента (клиент должен видеть пакет с нашим node_num)
+                setattr(packet_copy_for_client, 'from', self.node_num)
                 info("TCP", f"[{self._log_prefix()}] Set packet.from={self.node_num:08X} (was 0) before MQTT publish")
             else:
                 # Если from уже установлен, это может быть пересылаемый пакет
@@ -878,16 +906,34 @@ class TCPConnectionSession:
             
             # Обработка пакетов позиции от клиента (как в firmware PositionModule::handleReceivedProtobuf)
             # Android клиент отправляет позицию из GPS через POSITION_APP пакет
+            # ВАЖНО: В firmware handleReceivedProtobuf возвращает false, что означает, что другие модули тоже могут обработать пакет
+            # Но для TCP клиента мы обрабатываем пакет полностью здесь
+            # ВАЖНО: В firmware для пакетов от клиента (isFromUs) используется setLocalPosition, а не updatePosition
+            # Но для TCP клиента пакеты имеют from=0, поэтому мы используем update_position для нашего node_num
             if hasattr(packet.decoded, 'portnum') and packet.decoded.portnum == portnums_pb2.PortNum.POSITION_APP:
-                info("POSITION", f"[{self._log_prefix()}] 🔍️ Received POSITION_APP packet from client (id={packet.id})")
+                info("POSITION", f"[{self._log_prefix()}] 🔍️ Received POSITION_APP packet from client (id={packet.id}, want_ack={want_ack}, want_response={getattr(packet.decoded, 'want_response', False)})")
                 try:
                     position = mesh_pb2.Position()
                     position.ParseFromString(packet.decoded.payload)
+                    
+                    # ВАЖНО: Устанавливаем время из позиции (как в firmware trySetRtc)
+                    # Если есть время и канал PRIMARY, устанавливаем RTC время
+                    if hasattr(position, 'time') and position.time > 0:
+                        ch = self.channels.get_by_index(channel_index)
+                        if ch.role == channel_pb2.Channel.Role.PRIMARY:  # PRIMARY channel (как в firmware meshtastic_Channel_Role_PRIMARY)
+                            # Устанавливаем RTC время из позиции (как в firmware trySetRtc)
+                            # RTCQualityNTP для времени от клиента (как в firmware)
+                            result = self.rtc.perhaps_set_rtc(RTCQuality.NTP, position.time, force_update=False)
+                            if result == RTCSetResult.SUCCESS:
+                                debug("POSITION", f"[{self._log_prefix()}] Set RTC time from position: {position.time}")
+                    
                     # Обновляем позицию в NodeDB (как в firmware nodeDB->updatePosition)
                     # Если fixed_position не установлен, обновляем позицию (как в Android: if (!localConfig.position.fixedPosition))
                     if not self.config_storage.config.position.fixed_position:
                         self.node_db.update_position(self.node_num, position)
                         info("POSITION", f"[{self._log_prefix()}] ✅ Updated position from client GPS: lat={position.latitude_i} ({position.latitude_i * 1e-7:.6f}°), lon={position.longitude_i} ({position.longitude_i * 1e-7:.6f}°), location_source={mesh_pb2.Position.LocSource.Name(position.location_source) if hasattr(position, 'location_source') else 'N/A'}")
+                        # ВАЖНО: Периодическая отправка позиции будет выполнена позже (не блокируем обработку)
+                        debug("POSITION", f"[{self._log_prefix()}] Position updated, periodic broadcast will send it later (not blocking packet processing)")
                     else:
                         debug("POSITION", f"[{self._log_prefix()}] Ignoring position update from client (fixed_position is enabled)")
                 except Exception as e:
@@ -895,8 +941,24 @@ class TCPConnectionSession:
                     import traceback
                     traceback.print_exc()
             
+            # Публикация в MQTT (если клиент есть)
+            # ВАЖНО: Публикация в MQTT теперь асинхронная (через очередь и отдельный поток)
+            # Это предотвращает блокировку TCP обработки даже при проблемах с MQTT
+            # Пакеты добавляются в очередь и публикуются в фоновом потоке
             if self.mqtt_client:
-                self.mqtt_client.publish_packet(packet, channel_index)
+                try:
+                    # Для POSITION_APP добавляем дополнительное логирование
+                    if hasattr(packet.decoded, 'portnum') and packet.decoded.portnum == portnums_pb2.PortNum.POSITION_APP:
+                        debug("MQTT", f"[{self._log_prefix()}] Queueing POSITION_APP for async MQTT publish...")
+                    # Добавляем пакет в очередь для асинхронной публикации (не блокирует)
+                    self.mqtt_client.publish_packet(packet, channel_index)
+                    if hasattr(packet.decoded, 'portnum') and packet.decoded.portnum == portnums_pb2.PortNum.POSITION_APP:
+                        debug("MQTT", f"[{self._log_prefix()}] POSITION_APP queued for MQTT, continuing packet processing...")
+                except Exception as e:
+                    # Ошибка добавления в очередь MQTT - логируем, но не прерываем обработку
+                    error("MQTT", f"[{self._log_prefix()}] Error queueing packet for MQTT (non-critical): {e}")
+                    import traceback
+                    traceback.print_exc()
             
             # Обработка запросов позиции (как в firmware PositionModule::allocReply)
             if hasattr(packet.decoded, 'portnum') and packet.decoded.portnum == portnums_pb2.PortNum.POSITION_APP:
@@ -921,6 +983,134 @@ class TCPConnectionSession:
                 portnum_name = packet.decoded.portnum if hasattr(packet.decoded, 'portnum') else 'N/A'
                 debug("ACK", f"[{self._log_prefix()}] Sending ACK for packet {packet.id} (portnum={portnum_name}, from={packet_from:08X})")
                 self._send_ack(packet, channel_index)
+            else:
+                # Логируем, если ACK не отправляется (для диагностики)
+                if hasattr(packet.decoded, 'portnum') and packet.decoded.portnum == portnums_pb2.PortNum.POSITION_APP:
+                    debug("ACK", f"[{self._log_prefix()}] POSITION_APP packet {packet.id}: want_ack={want_ack}, ACK not sent (normal)")
+            
+            # ВАЖНО: Отправляем пакет обратно клиенту через FromRadio (как в firmware MeshService::handleFromRadio)
+            # В firmware порядок:
+            # 1. sendToMesh вызывает nodeDB->updateFrom() ПЕРЕД отправкой в mesh
+            # 2. sendToMesh вызывает router->sendLocal()
+            # 3. Если isToUs, sendLocal вызывает enqueueReceivedMessage()
+            # 4. Пакет обрабатывается через handleReceived → RoutingModule → handleFromRadio
+            # 5. handleFromRadio вызывает sendToPhone() - отправляет пакет клиенту
+            #
+            # ВАЖНО: В firmware RoutingModule::handleReceivedProtobuf отправляет пакет клиенту только если:
+            # - (isBroadcast(mp.to) || isToUs(&mp)) && (mp.from != 0)
+            # Но для пакетов от клиента (from=0) с to=node_num, они обрабатываются через enqueueReceivedMessage
+            # и отправляются клиенту через fromRadioQueue → getFromRadio
+            #
+            # ВАЖНО: В firmware sendToMesh отправляет QueueStatus клиенту СРАЗУ после sendLocal
+            # (как в firmware MeshService::sendToMesh -> sendQueueStatusToPhone)
+            # QueueStatus имеет ВЫСОКИЙ приоритет и отправляется ПЕРЕД эхом пакета
+            # ВАЖНО: QueueStatus отправляется НЕМЕДЛЕННО (не через очередь), чтобы клиент получил его сразу
+            # Это критично для клиентов, которые блокируются на чтении и ожидают ответ
+            try:
+                # Создаем QueueStatus (как в firmware router->getQueueStatus())
+                # В firmware QueueStatus содержит информацию о состоянии очереди отправки
+                # Для симулятора мы можем отправить простой QueueStatus с res=0 (успех)
+                queue_status = mesh_pb2.QueueStatus()
+                queue_status.res = 0  # ERRNO_OK
+                queue_status.mesh_packet_id = packet.id
+                queue_status.free = 100  # Достаточно места в очереди
+                queue_status.maxlen = 100  # Максимальный размер очереди
+                
+                # Отправляем QueueStatus клиенту НЕМЕДЛЕННО (как в firmware, QueueStatus имеет высокий приоритет)
+                # В firmware QueueStatus отправляется через toPhoneQueueStatusQueue, но обрабатывается ПЕРВЫМ в getFromRadio
+                # Для немедленной доставки отправляем напрямую
+                from_radio_queue_status = mesh_pb2.FromRadio()
+                # В protobuf поле называется queueStatus (camelCase), а не queue_status
+                from_radio_queue_status.queueStatus.CopyFrom(queue_status)
+                
+                # Отправляем НЕМЕДЛЕННО (не через очередь), чтобы клиент получил ответ сразу
+                # Это критично для клиентов, которые блокируются на чтении
+                self._send_from_radio(from_radio_queue_status)
+                if is_position_app:
+                    info("POSITION", f"[{self._log_prefix()}] ✅ Sent QueueStatus immediately to client (mesh_packet_id={packet.id}, res=0)")
+                else:
+                    debug("TCP", f"[{self._log_prefix()}] Sent QueueStatus immediately to client (mesh_packet_id={packet.id}, res=0)")
+            except Exception as e:
+                # Ошибка отправки QueueStatus - не критично, логируем
+                debug("TCP", f"[{self._log_prefix()}] Error sending QueueStatus to client (non-critical): {e}")
+            
+            # ВАЖНО: В firmware для пакетов от клиента (from=0) с to=node_num:
+            # 1. sendLocal вызывает enqueueReceivedMessage (если isToUs)
+            # 2. Пакет обрабатывается через handleReceived → RoutingModule → handleFromRadio
+            # 3. НО! RoutingModule::handleReceivedProtobuf отправляет пакет клиенту только если:
+            #    - (isBroadcast(mp.to) || isToUs(&mp)) && (mp.from != 0)
+            # 4. Для пакетов от клиента (from=0) они НЕ отправляются обратно через RoutingModule
+            # 5. Они обрабатываются через enqueueReceivedMessage → fromRadioQueue → getFromRadio
+            #
+            # ВАЖНО: В firmware sendToMesh вызывается с ccToPhone=false по умолчанию
+            # Это означает, что пакеты от клиента НЕ отправляются обратно напрямую
+            # Они отправляются только через fromRadioQueue → getFromRadio (асинхронно)
+            #
+            # Для POSITION_APP пакетов от клиента НЕ отправляем эхо - они обрабатываются асинхронно
+            # QueueStatus отправляется немедленно, что достаточно для клиента
+            is_broadcast = (packet_to == 0xFFFFFFFF or packet_to == 0xFFFFFFFE)
+            is_to_us = (packet_to == self.node_num) if not is_broadcast else False
+            is_from_client = (packet_from == 0)  # Пакет от клиента (from=0)
+            
+            # ВАЖНО: НЕ отправляем эхо для POSITION_APP пакетов от клиента
+            # В firmware они обрабатываются асинхронно через fromRadioQueue
+            # QueueStatus отправляется немедленно, что достаточно для клиента
+            should_send_echo = False  # НЕ отправляем эхо для пакетов от клиента (как в firmware)
+            
+            # ВАЖНО: Детальное логирование для POSITION_APP пакетов
+            if is_position_app:
+                info("POSITION", f"[{self._log_prefix()}] 🔍 POSITION_APP routing check: from={packet_from:08X}, to={packet_to:08X}, node_num={self.node_num:08X}, is_broadcast={is_broadcast}, is_to_us={is_to_us}, is_from_client={is_from_client}, should_send_echo={should_send_echo} (NO ECHO for client packets)")
+            
+            if should_send_echo:
+                try:
+                    # Устанавливаем rx_time в копии для клиента (как в firmware Router::handleReceived)
+                    rx_time = self.rtc.get_valid_time(RTCQuality.FROM_NET)
+                    if rx_time > 0:
+                        packet_copy_for_client.rx_time = rx_time
+                    
+                    # ВАЖНО: Для POSITION_APP пакетов от клиента отправляем эхо НЕМЕДЛЕННО
+                    # Это критично для клиентов, которые блокируются на чтении и ожидают ответ
+                    # Для других пакетов отправляем через очередь (как в firmware sendToPhone → toPhoneQueue)
+                    from_radio_echo = mesh_pb2.FromRadio()
+                    from_radio_echo.packet.CopyFrom(packet_copy_for_client)
+                    
+                    if is_position_app:
+                        # Для POSITION_APP отправляем НЕМЕДЛЕННО, чтобы клиент получил ответ сразу
+                        self._send_from_radio(from_radio_echo)
+                        info("POSITION", f"[{self._log_prefix()}] ✅ Sent packet echo immediately to client (id={packet.id}, to={packet_to:08X}, is_to_us={is_to_us}, is_broadcast={is_broadcast}, from={getattr(packet_copy_for_client, 'from', 0):08X})")
+                    else:
+                        # Для других пакетов отправляем через очередь (как в firmware sendToPhone)
+                        serialized = from_radio_echo.SerializeToString()
+                        framed = StreamAPI.add_framing(serialized)
+                        
+                        if self.mqtt_client and hasattr(self.mqtt_client, 'to_client_queue'):
+                            try:
+                                self.mqtt_client.to_client_queue.put_nowait(framed)
+                                debug("TCP", f"[{self._log_prefix()}] Queued packet echo to client (id={packet.id}, to={packet_to:08X}, is_to_us={is_to_us}, is_broadcast={is_broadcast}, from={getattr(packet_copy_for_client, 'from', 0):08X})")
+                            except queue.Full:
+                                warn("TCP", f"[{self._log_prefix()}] Client queue full, dropping packet echo")
+                                # Если очередь переполнена, отправляем напрямую (fallback)
+                                self._send_from_radio(from_radio_echo)
+                                debug("TCP", f"[{self._log_prefix()}] Sent packet echo directly (queue full, id={packet.id})")
+                        else:
+                            # Fallback - отправляем напрямую если очередь недоступна
+                            self._send_from_radio(from_radio_echo)
+                            debug("TCP", f"[{self._log_prefix()}] Sent packet echo directly (queue unavailable, id={packet.id}, to={packet_to:08X}, is_to_us={is_to_us}, is_broadcast={is_broadcast}, from={getattr(packet_copy_for_client, 'from', 0):08X})")
+                except Exception as e:
+                    # Ошибка отправки эха - не критично, логируем
+                    debug("TCP", f"[{self._log_prefix()}] Error sending packet echo to client (non-critical): {e}")
+            else:
+                # Пакет не адресован нам и не broadcast - не отправляем эхо (как в firmware)
+                if is_position_app:
+                    info("POSITION", f"[{self._log_prefix()}] ⚠️ POSITION_APP packet not addressed to us (to={packet_to:08X}, node_num={self.node_num:08X}), not sending echo")
+                else:
+                    debug("TCP", f"[{self._log_prefix()}] Packet not addressed to us (to={packet_to:08X}, node_num={self.node_num:08X}), not sending echo")
+            
+            # ВАЖНО: После обработки POSITION_APP пакета продолжаем нормальную работу
+            # Это гарантирует, что обработка не блокирует последующие пакеты
+            if hasattr(packet.decoded, 'portnum') and packet.decoded.portnum == portnums_pb2.PortNum.POSITION_APP:
+                info("POSITION", f"[{self._log_prefix()}] ✅ POSITION_APP processing complete, ready for next packet (id={packet.id})")
+            debug("TCP", f"[{self._log_prefix()}] Finished processing MeshPacket id={packet.id}, continuing...")
         except Exception as e:
             error("TCP", f"[{self._log_prefix()}] Error processing MeshPacket: {e}")
             import traceback
@@ -978,10 +1168,20 @@ class TCPConnectionSession:
             traceback.print_exc()
     
     def _send_ack(self, packet: mesh_pb2.MeshPacket, channel_index: int) -> None:
-        """Отправляет ACK пакет обратно клиенту"""
+        """Отправляет ACK пакет обратно клиенту (как в firmware ReliableRouter::sniffReceived)"""
         try:
+            # Проверяем, нужно ли отправлять ACK с want_ack=true для надежной доставки
+            # (как в firmware shouldSuccessAckWithWantAck)
+            ack_wants_ack = PacketHandler.should_success_ack_with_want_ack(packet, self.node_num)
+            
             # Используем PacketHandler для создания ACK пакета
-            ack_packet = PacketHandler.create_ack_packet(packet, self.node_num, channel_index)
+            ack_packet = PacketHandler.create_ack_packet(
+                packet, 
+                self.node_num, 
+                channel_index,
+                error_reason=None,
+                ack_wants_ack=ack_wants_ack
+            )
             
             def send_ack_delayed():
                 time.sleep(0.1)  # 100ms задержка
@@ -992,7 +1192,8 @@ class TCPConnectionSession:
                     packet_from = getattr(packet, 'from', 0)
                     packet_to = packet.to
                     is_broadcast = packet_to == 0xFFFFFFFF
-                    debug("ACK", f"[{self._log_prefix()}] Sent ACK (async): packet_id={ack_packet.id}, request_id={packet.id}, to={packet_from:08X}, from={self.node_num:08X}, channel={channel_index}, packet_to={packet_to:08X}, broadcast={is_broadcast}, error_reason=NONE")
+                    want_ack_info = f", want_ack={ack_wants_ack}" if ack_wants_ack else ""
+                    debug("ACK", f"[{self._log_prefix()}] Sent ACK (async): packet_id={ack_packet.id}, request_id={packet.id}, to={packet_from:08X}, from={self.node_num:08X}, channel={channel_index}, packet_to={packet_to:08X}, broadcast={is_broadcast}, error_reason=NONE{want_ack_info}")
                 except Exception as e:
                     error("ACK", f"[{self._log_prefix()}] Error sending ACK (async): {e}")
             
@@ -1000,7 +1201,8 @@ class TCPConnectionSession:
             ack_thread = threading.Thread(target=send_ack_delayed, daemon=True)
             ack_thread.start()
             
-            debug("ACK", f"[{self._log_prefix()}] Started async ACK send for packet {packet.id} (delay 100ms)")
+            want_ack_info = f" (with want_ack=True)" if ack_wants_ack else ""
+            debug("ACK", f"[{self._log_prefix()}] Started async ACK send for packet {packet.id} (delay 100ms){want_ack_info}")
         except Exception as e:
             error("ACK", f"[{self._log_prefix()}] Error sending ACK: {e}")
             import traceback
@@ -1446,12 +1648,20 @@ class TCPConnectionSession:
             finally:
                 self.mqtt_client = None
         
-        # Закрываем TCP сокет
+        # Закрываем TCP сокет (проверяем, что он еще открыт)
         if self.client_socket:
             try:
-                self.client_socket.close()
-            except:
-                pass
+                # Проверяем, что сокет еще открыт, перед попыткой закрыть
+                try:
+                    self.client_socket.getpeername()
+                    # Сокет открыт - закрываем его
+                    self.client_socket.close()
+                except (OSError, AttributeError):
+                    # Сокет уже закрыт или невалиден - это нормально
+                    debug("SESSION", f"[{self._log_prefix()}] Socket already closed or invalid")
+            except Exception as e:
+                # Другие ошибки при закрытии - логируем, но не критично
+                debug("SESSION", f"[{self._log_prefix()}] Error closing socket: {e}")
         
         # Даем время на завершение всех потоков
         time.sleep(0.1)

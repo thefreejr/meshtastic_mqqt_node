@@ -74,18 +74,73 @@ class PacketHandler:
         return not is_routing_ack
     
     @staticmethod
+    def should_success_ack_with_want_ack(packet: mesh_pb2.MeshPacket, our_node_num: int) -> bool:
+        """
+        Проверяет, нужно ли отправлять ACK с want_ack=true для надежной доставки ACK пакета
+        (как в firmware ReliableRouter::shouldSuccessAckWithWantAck)
+        
+        Args:
+            packet: MeshPacket для проверки
+            our_node_num: Наш node_num (для проверки isFromUs)
+            
+        Returns:
+            True если ACK должен иметь want_ack=true, False иначе
+        """
+        # Don't ACK-with-want-ACK outgoing packets
+        packet_from = getattr(packet, 'from', 0)
+        if packet_from == 0 or packet_from == our_node_num:
+            return False
+        
+        # Only ACK-with-want-ACK if the original packet asked for want_ack
+        want_ack = getattr(packet, 'want_ack', False)
+        if not want_ack:
+            return False
+        
+        # Only ACK-with-want-ACK packets to us (not broadcast)
+        packet_to = packet.to
+        is_broadcast = (packet_to == 0xFFFFFFFF or packet_to == 0xFFFFFFFE)
+        if is_broadcast or packet_to != our_node_num:
+            return False
+        
+        # Special case for text message DMs:
+        payload_type = packet.WhichOneof('payload_variant')
+        if payload_type != 'decoded':
+            return False
+        
+        if not hasattr(packet.decoded, 'portnum'):
+            return False
+        
+        portnum = packet.decoded.portnum
+        is_text_message = (
+            portnum == portnums_pb2.PortNum.TEXT_MESSAGE_APP or
+            portnum == portnums_pb2.PortNum.TEXT_MESSAGE_COMPRESSED_APP
+        )
+        
+        if is_text_message:
+            # If it's a non-broadcast text message, and the original asked for want_ack,
+            # let's send an ACK that is itself want_ack to improve reliability of confirming delivery back to the sender.
+            # This should include all DMs regardless of whether or not reply_id is set.
+            return True
+        
+        return False
+    
+    @staticmethod
     def create_ack_packet(original_packet: mesh_pb2.MeshPacket, 
                           our_node_num: int, 
                           channel_index: int,
-                          error_reason: int = None) -> mesh_pb2.MeshPacket:
+                          error_reason: int = None,
+                          ack_wants_ack: bool = False) -> mesh_pb2.MeshPacket:
         """
         Создает ACK/NAK пакет для исходного пакета
+        (как в firmware MeshModule::allocAckNak и RoutingModule::sendAckNak)
         
         Args:
             original_packet: Исходный пакет, для которого создается ACK/NAK
             our_node_num: Наш node_num (для поля from)
             channel_index: Индекс канала
             error_reason: Причина ошибки для NAK (Routing.Error), если None - ACK (NONE)
+            ack_wants_ack: Если True, ACK пакет будет иметь want_ack=true для надежной доставки
+                          (используется для текстовых сообщений, как в firmware)
             
         Returns:
             MeshPacket с ACK/NAK
@@ -112,7 +167,9 @@ class PacketHandler:
         ack_packet.decoded.payload = routing_msg.SerializeToString()
         ack_packet.priority = mesh_pb2.MeshPacket.Priority.ACK
         ack_packet.hop_limit = hop_limit
-        ack_packet.want_ack = False  # ACK на ACK не нужен
+        # Allow the caller to set want_ack on this ACK packet if it's important that the ACK be delivered reliably
+        # (как в firmware RoutingModule::sendAckNak)
+        ack_packet.want_ack = ack_wants_ack
         ack_packet.hop_start = hop_limit
         
         return ack_packet

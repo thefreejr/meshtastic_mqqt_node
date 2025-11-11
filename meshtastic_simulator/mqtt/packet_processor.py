@@ -146,11 +146,17 @@ class MQTTPacketProcessor:
                                         break
                         
                         if sender_session and envelope.packet.want_ack:
+                            # Проверяем, нужно ли отправлять ACK с want_ack=true для надежной доставки
+                            # (для собственных пакетов это обычно False, так как isFromUs)
+                            ack_wants_ack = PacketHandler.should_success_ack_with_want_ack(envelope.packet, our_node_num)
+                            
                             # Создаем локальный ACK для клиента (не через MQTT, а напрямую клиенту)
                             ack_packet = PacketHandler.create_ack_packet(
                                 envelope.packet,
                                 our_node_num,
-                                envelope.packet.channel if envelope.packet.channel < 8 else 0
+                                envelope.packet.channel if envelope.packet.channel < 8 else 0,
+                                error_reason=None,
+                                ack_wants_ack=ack_wants_ack
                             )
                             
                             # Отправляем ACK напрямую клиенту (локально, не через MQTT)
@@ -164,11 +170,19 @@ class MQTTPacketProcessor:
                             except queue.Full:
                                 warn("MQTT", f"Client queue is full, dropping ACK packet")
                             debug("ACK", f"Sent implicit ACK locally for own packet {envelope.packet.id} (gateway_id={envelope.gateway_id}, request_id={ack_packet.decoded.request_id})")
+                        else:
+                            # Пакет не требует ACK (want_ack=False) - это нормально для POSITION_APP и других пакетов
+                            if sender_session:
+                                debug("MQTT", f"Own packet {envelope.packet.id} does not require ACK (want_ack=False), skipping implicit ACK")
                     except Exception as e:
                         debug("ACK", f"Error sending implicit ACK for own packet: {e}")
                     
                     # Игнорируем собственный пакет (не обрабатываем дальше)
-                    debug("MQTT", f"Ignoring own packet (gateway_id={envelope.gateway_id}, packet.from={packet_from_envelope:08X}, implicit ACK sent locally)")
+                    # ВАЖНО: Для пакетов с want_ack=False это нормально - они не требуют ACK
+                    if envelope.packet.want_ack:
+                        debug("MQTT", f"Ignoring own packet (gateway_id={envelope.gateway_id}, packet.from={packet_from_envelope:08X}, implicit ACK sent locally)")
+                    else:
+                        debug("MQTT", f"Ignoring own packet (gateway_id={envelope.gateway_id}, packet.from={packet_from_envelope:08X}, no ACK needed)")
                     return False
                 else:
                     # Это не наш пакет, но gateway_id совпадает - игнорируем
@@ -316,6 +330,8 @@ class MQTTPacketProcessor:
                     should_send_nodeinfo = True
                     
                     # Пропускаем TELEMETRY_APP пакеты с request_id (как в firmware)
+                    # ВАЖНО: Также пропускаем POSITION_APP пакеты - они не требуют отправки NodeInfo
+                    # (как в firmware - позиция обновляется, но NodeInfo отправляется только при первом пакете от новой ноды)
                     if packet.WhichOneof('payload_variant') == 'decoded':
                         # Убеждаемся, что portnums_pb2 доступен
                         if portnums_pb2 and hasattr(packet.decoded, 'portnum'):
@@ -323,6 +339,12 @@ class MQTTPacketProcessor:
                                 if hasattr(packet.decoded, 'request_id') and packet.decoded.request_id > 0:
                                     should_send_nodeinfo = False
                                     debug("MQTT", f"Skipping NodeInfo send: telemetry response packet")
+                            elif packet.decoded.portnum == portnums_pb2.PortNum.POSITION_APP:
+                                # ВАЖНО: Пропускаем отправку NodeInfo для POSITION_APP пакетов
+                                # (позиция обновляется, но NodeInfo отправляется только при первом пакете от новой ноды)
+                                # Это предотвращает переполнение очереди клиента при частых обновлениях позиции
+                                should_send_nodeinfo = False
+                                debug("MQTT", f"Skipping NodeInfo send: POSITION_APP packet (position updates don't require NodeInfo)")
                     
                     if should_send_nodeinfo:
                         # Проверяем ДО обновления NodeDB, есть ли у получателя информация о пользователе отправителя
@@ -540,11 +562,19 @@ class MQTTPacketProcessor:
                         traceback.print_exc()
                     
                     # Отправляем NodeInfo клиенту, если есть информация о пользователе
+                    # ВАЖНО: Пропускаем отправку NodeInfo для POSITION_APP пакетов (как в firmware)
+                    # Это предотвращает переполнение очереди клиента при частых обновлениях позиции
+                    is_position_packet = False
+                    if packet.WhichOneof('payload_variant') == 'decoded':
+                        if portnums_pb2 and hasattr(packet.decoded, 'portnum'):
+                            is_position_packet = (packet.decoded.portnum == portnums_pb2.PortNum.POSITION_APP)
+                    
                     has_user_info = (hasattr(node_info, 'user') and 
                                     ((hasattr(node_info.user, 'short_name') and node_info.user.short_name) or
                                      (hasattr(node_info.user, 'long_name') and node_info.user.long_name)))
                     
-                    if has_user_info:
+                    # ВАЖНО: Не отправляем NodeInfo для POSITION_APP пакетов (позиция обновляется, но NodeInfo не нужен)
+                    if has_user_info and not is_position_packet:
                         # Проверяем, что телеметрия установлена перед отправкой
                         has_telemetry = hasattr(node_info, 'device_metrics') and node_info.HasField('device_metrics')
                         if not has_telemetry:
@@ -704,21 +734,32 @@ class MQTTPacketProcessor:
             # В firmware все пакеты отправляются клиенту, независимо от того, от кого они пришли
             # ВАЖНО: Для PKI канала пакеты отправляются даже если не расшифрованы (как в firmware MQTT.cpp:117-123)
             # ВАЖНО: Проверяем, что очередь не переполнена (предотвращает утечку памяти)
-            try:
-                from_radio = mesh_pb2.FromRadio()
-                from_radio.packet.CopyFrom(packet)
-                
-                serialized = from_radio.SerializeToString()
-                framed = StreamAPI.add_framing(serialized)
-                # Используем put_nowait для избежания блокировки, если очередь переполнена
+            # ВАЖНО: Для собственных POSITION_APP пакетов из MQTT не отправляем пакет клиенту
+            # (клиент уже отправил этот пакет, не нужно отправлять его обратно)
+            is_own_position_packet = False
+            if is_own_gateway and packet.WhichOneof('payload_variant') == 'decoded':
+                if portnums_pb2 and hasattr(packet.decoded, 'portnum'):
+                    is_own_position_packet = (packet.decoded.portnum == portnums_pb2.PortNum.POSITION_APP)
+            
+            if not is_own_position_packet:
                 try:
-                    to_client_queue.put_nowait(framed)
-                except queue.Full:
-                    # Если очередь переполнена, логируем предупреждение и пропускаем пакет
-                    # (лучше потерять пакет, чем накапливать их в памяти)
-                    warn("MQTT", f"Client queue is full, dropping packet from !{packet_from:08X}")
-            except Exception as e:
-                error("MQTT", f"Error preparing packet for client: {e}")
+                    from_radio = mesh_pb2.FromRadio()
+                    from_radio.packet.CopyFrom(packet)
+                    
+                    serialized = from_radio.SerializeToString()
+                    framed = StreamAPI.add_framing(serialized)
+                    # Используем put_nowait для избежания блокировки, если очередь переполнена
+                    try:
+                        to_client_queue.put_nowait(framed)
+                    except queue.Full:
+                        # Если очередь переполнена, логируем предупреждение и пропускаем пакет
+                        # (лучше потерять пакет, чем накапливать их в памяти)
+                        warn("MQTT", f"Client queue is full, dropping packet from !{packet_from:08X}")
+                except Exception as e:
+                    error("MQTT", f"Error preparing packet for client: {e}")
+            else:
+                # Собственный POSITION_APP пакет из MQTT - не отправляем клиенту (клиент уже отправил его)
+                debug("MQTT", f"Skipping sending own POSITION_APP packet to client (packet.id={packet.id}, from=!{packet_from:08X})")
             
             # Логируем отправку пакета клиенту
             payload_type = packet.WhichOneof('payload_variant')
@@ -785,12 +826,19 @@ class MQTTPacketProcessor:
                                 ack_error = mesh_pb2.Routing.Error.NO_CHANNEL
                                 debug("ACK", f"Encrypted packet from !{packet_from:08X} not decrypted, sending NO_CHANNEL NAK")
                         
-                        # Создаем ACK/NAK пакет (как в firmware MeshModule::allocAckNak)
+                        # Проверяем, нужно ли отправлять ACK с want_ack=true для надежной доставки
+                        # (как в firmware shouldSuccessAckWithWantAck)
+                        ack_wants_ack = False
+                        if ack_error is None:  # Только для ACK (не NAK)
+                            ack_wants_ack = PacketHandler.should_success_ack_with_want_ack(packet, our_node_num)
+                        
+                        # Создаем ACK/NAK пакет (как в firmware MeshModule::allocAckNak и RoutingModule::sendAckNak)
                         ack_packet = PacketHandler.create_ack_packet(
                             packet, 
                             our_node_num, 
                             packet.channel if packet.channel < 8 else 0,
-                            ack_error  # Передаем ошибку для NAK (None = ACK)
+                            ack_error,  # Передаем ошибку для NAK (None = ACK)
+                            ack_wants_ack=ack_wants_ack
                         )
                         
                         # Находим сессию получателя (наша сессия) для отправки ACK через MQTT
@@ -806,8 +854,9 @@ class MQTTPacketProcessor:
                         if receiver_session and receiver_session.mqtt_client and receiver_session.mqtt_client.connected:
                             channel_index = packet.channel if packet.channel < 8 else 0
                             receiver_session.mqtt_client.publish_packet(ack_packet, channel_index)
+                            want_ack_info = f", want_ack={ack_wants_ack}" if ack_wants_ack else ""
                             if ack_error is None:
-                                info("ACK", f"Sent ACK via MQTT for packet {packet.id} from !{packet_from:08X} to !{packet_to:08X} (request_id={ack_packet.decoded.request_id})")
+                                info("ACK", f"Sent ACK via MQTT for packet {packet.id} from !{packet_from:08X} to !{packet_to:08X} (request_id={ack_packet.decoded.request_id}{want_ack_info})")
                             else:
                                 info("ACK", f"Sent NAK via MQTT for packet {packet.id} from !{packet_from:08X} to !{packet_to:08X} (error={ack_error}, request_id={ack_packet.decoded.request_id})")
                         else:

@@ -37,7 +37,14 @@ class MQTTClient:
         self.channels = channels
         self.node_db = node_db
         self.server = server  # Ссылка на TCPServer для доступа к сессиям
-        self.to_client_queue = queue.Queue()
+        # ВАЖНО: Ограничиваем размер очереди для клиента (как в firmware MAX_RX_TOPHONE=32)
+        # Это предотвращает утечку памяти и блокировку при переполнении
+        self.to_client_queue = queue.Queue(maxsize=32)  # Ограничиваем размер очереди (как в firmware)
+        
+        # Очередь для асинхронной публикации MQTT пакетов (предотвращает блокировку TCP обработки)
+        self.publish_queue = queue.Queue(maxsize=100)  # Ограничиваем размер очереди для предотвращения утечки памяти
+        self.publish_thread = None  # Поток для публикации пакетов
+        self.publish_stop = threading.Event()  # Событие для остановки потока публикации
         
         # Инициализируем модули
         self.connection = None
@@ -221,6 +228,8 @@ class MQTTClient:
                         self._connecting = False
                     # Подписываемся на каналы
                     self.subscription.subscribe_to_channels(client)
+                    # Запускаем поток для асинхронной публикации MQTT пакетов
+                    self._start_publish_thread()
                 else:
                     # При ошибке подключения сбрасываем флаг подключения
                     with self._connecting_lock:
@@ -274,8 +283,65 @@ class MQTTClient:
         """Возвращает объект paho.mqtt.client"""
         return self.connection.get_client() if self.connection else None
     
+    def _start_publish_thread(self):
+        """Запускает поток для асинхронной публикации MQTT пакетов"""
+        if self.publish_thread and self.publish_thread.is_alive():
+            # Поток уже запущен
+            return
+        
+        self.publish_stop.clear()
+        self.publish_thread = threading.Thread(target=self._publish_worker, daemon=True)
+        self.publish_thread.start()
+        debug("MQTT", f"[{self.node_id}] Started MQTT publish thread")
+    
+    def _publish_worker(self):
+        """Рабочий поток для публикации MQTT пакетов из очереди"""
+        packets_processed = 0
+        while not self.publish_stop.is_set():
+            try:
+                # Получаем пакет из очереди с таймаутом (проверяем stop каждую секунду)
+                try:
+                    item = self.publish_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                
+                packet, channel_index, channel_id, topic, payload, packet_from = item
+                
+                # Проверяем подключение перед публикацией
+                if not self.connected or not self.client:
+                    warn("MQTT", f"MQTT not connected, dropping packet from queue (from={packet_from:08X})")
+                    self.publish_queue.task_done()
+                    continue
+                
+                try:
+                    # Публикуем пакет (неблокирующий вызов)
+                    # ВАЖНО: client.publish() может блокировать, если внутренняя очередь MQTT переполнена
+                    # В paho-mqtt publish() возвращает MQTTMessageInfo, который может блокировать при wait_for_publish=True
+                    # По умолчанию wait_for_publish=False, поэтому вызов не должен блокировать
+                    result = self.client.publish(topic, payload, qos=0)
+                    # result.rc может быть MQTT_ERR_QUEUE_SIZE если очередь переполнена
+                    if result.rc != 0:
+                        warn("MQTT", f"Publish returned error code {result.rc} for topic {topic} (queue may be full, packet from={packet_from:08X}, id={packet.id})")
+                    else:
+                        packets_processed += 1
+                        if channel_id == "Custom":
+                            info("MQTT", f"✅ CUSTOM PACKET SENT: topic={topic}, from={packet_from:08X}")
+                        else:
+                            debug("MQTT", f"Packet sent: {topic} (channel {channel_index}: {channel_id}, from={packet_from:08X}, id={packet.id}, total_processed={packets_processed})")
+                except Exception as e:
+                    error("MQTT", f"Error publishing packet in worker thread (from={packet_from:08X}, id={packet.id}): {e}")
+                    import traceback
+                    traceback.print_exc()
+                
+                # Помечаем задачу как выполненную
+                self.publish_queue.task_done()
+            except Exception as e:
+                error("MQTT", f"Error in publish worker thread: {e}")
+                import traceback
+                traceback.print_exc()
+    
     def publish_packet(self, packet: mesh_pb2.MeshPacket, channel_index: int):
-        """Публикует пакет в MQTT (как в firmware MQTT::onSend)"""
+        """Добавляет пакет в очередь для асинхронной публикации в MQTT (не блокирует TCP обработку)"""
         try:
             # Логируем информацию о трассировке маршрута для исходящих пакетов
             hop_limit = getattr(packet, 'hop_limit', 0)
@@ -309,7 +375,7 @@ class MQTTClient:
             
             # Логируем поле from перед отправкой
             packet_from = getattr(packet, 'from', 0)
-            debug("MQTT", f"Publishing packet: from={packet_from:08X}, to={packet.to:08X}, id={packet.id}, channel={channel_index}")
+            debug("MQTT", f"Queueing packet for MQTT: from={packet_from:08X}, to={packet.to:08X}, id={packet.id}, channel={channel_index}")
             
             envelope = mqtt_pb2.ServiceEnvelope()
             envelope.packet.CopyFrom(packet)
@@ -321,21 +387,22 @@ class MQTTClient:
             crypt_topic = f"{self.root_topic}/2/e/"
             topic = f"{crypt_topic}{channel_id}/{self.node_id}"
             
-            if self.connected and self.client:
-                # Для Custom канала добавляем детальное логирование
-                if channel_id == "Custom":
-                    info("MQTT", f"📤 CUSTOM PACKET SENDING: topic={topic}, gateway_id={self.node_id}, channel_id={channel_id}, from={packet_from:08X}, payload_size={len(payload)}")
-                self.client.publish(topic, payload)
-                if channel_id == "Custom":
-                    info("MQTT", f"✅ CUSTOM PACKET SENT: topic={topic}, from={packet_from:08X}")
-                else:
-                    info("MQTT", f"Packet sent: {topic} (channel {channel_index}: {channel_id}, from={packet_from:08X})")
+            # Для Custom канала добавляем детальное логирование
+            if channel_id == "Custom":
+                info("MQTT", f"📤 CUSTOM PACKET QUEUING: topic={topic}, gateway_id={self.node_id}, channel_id={channel_id}, from={packet_from:08X}, payload_size={len(payload)}")
+            
+            # ВАЖНО: Добавляем пакет в очередь для асинхронной публикации (не блокирует TCP обработку)
+            # Используем put_nowait для избежания блокировки, если очередь переполнена
+            try:
+                self.publish_queue.put_nowait((packet, channel_index, channel_id, topic, payload, packet_from))
                 return True
-            else:
-                warn("MQTT", "MQTT not connected, packet not sent")
+            except queue.Full:
+                # Если очередь переполнена, логируем предупреждение и пропускаем пакет
+                # (лучше потерять пакет, чем блокировать TCP обработку)
+                warn("MQTT", f"MQTT publish queue is full, dropping packet from={packet_from:08X}, id={packet.id}")
                 return False
         except Exception as e:
-            error("MQTT", f"Error publishing packet: {e}")
+            error("MQTT", f"Error queueing packet for MQTT: {e}")
             import traceback
             traceback.print_exc()
             return False
@@ -347,6 +414,24 @@ class MQTTClient:
             return
         
         self._stopped = True
+        
+        # Останавливаем поток публикации
+        if self.publish_thread and self.publish_thread.is_alive():
+            self.publish_stop.set()
+            # Ждем завершения потока (максимум 2 секунды)
+            self.publish_thread.join(timeout=2.0)
+            if self.publish_thread.is_alive():
+                warn("MQTT", f"[{self.node_id}] Publish thread did not finish in time, but it's daemon so will be terminated")
+        
+        # Очищаем очередь публикации (предотвращает утечку памяти)
+        try:
+            while not self.publish_queue.empty():
+                try:
+                    self.publish_queue.get_nowait()
+                except queue.Empty:
+                    break
+        except Exception as e:
+            debug("MQTT", f"[{self.node_id}] Error clearing publish_queue: {e}")
         
         # Очищаем очередь сообщений для клиента (предотвращает утечку памяти)
         try:

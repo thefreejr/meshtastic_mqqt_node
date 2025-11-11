@@ -4,6 +4,7 @@ TCP сервер для подключения meshtastic python CLI через 
 
 import queue
 import random
+import select
 import socket
 import struct
 import threading
@@ -33,7 +34,7 @@ except ImportError:
 from ..config import MAX_NUM_CHANNELS, START1, START2, HEADER_LEN, MAX_TO_FROM_RADIO_SIZE, DEFAULT_HOP_LIMIT, HOP_MAX, DEFAULT_MQTT_ADDRESS, DEFAULT_MQTT_USERNAME, DEFAULT_MQTT_PASSWORD, DEFAULT_MQTT_ROOT
 from ..utils.logger import log, debug, info, warn, error, LogLevel
 from ..mesh.config_storage import NodeConfig
-from ..protocol.stream_api import StreamAPI
+from ..protocol.stream_api import StreamAPI, StreamAPIStateMachine
 from ..mqtt.client import MQTTClient
 from ..mesh.channels import Channels
 from ..mesh.node_db import NodeDB
@@ -312,26 +313,34 @@ class TCPServer:
         info("TCP", "Server stopped")
     
     def _handle_client_session(self, session: TCPConnectionSession) -> None:
-        """Обрабатывает подключение TCP клиента через сессию"""
-        rx_buffer = bytes()
-        
+        """
+        Обрабатывает подключение TCP клиента через сессию (как в firmware StreamAPI::runOncePart)
+        Использует неблокирующий режим с адаптивным polling (5-250ms)
+        """
         # Настраиваем сокет для долгоживущих соединений (как в firmware и Android клиенте)
         try:
             # Включаем keepalive, чтобы соединение не закрывалось из-за отсутствия активности
             session.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             # TCP_NODELAY - отключает алгоритм Nagle для уменьшения задержки (как в Android клиенте)
             session.client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            # Таймаут для recv - достаточно большой, чтобы не закрывать соединение при отсутствии данных
-            # (в firmware используется неблокирующий режим с периодической проверкой)
-            # Android клиент использует soTimeout = 500 мс, но мы используем 1 секунду для большей стабильности
-            session.client_socket.settimeout(1.0)  # 1 секунда
+            # ВАЖНО: Переводим в неблокирующий режим (как в firmware)
+            session.client_socket.setblocking(False)
         except Exception as e:
             debug("TCP", f"[{session._log_prefix()}] Error setting socket options: {e}")
-            # Если не удалось установить опции, продолжаем с обычным таймаутом
+            # Если не удалось установить опции, продолжаем
             try:
-                session.client_socket.settimeout(1.0)
+                session.client_socket.setblocking(False)
             except:
                 pass
+        
+        # Создаем state machine для парсинга (как в firmware)
+        state_machine = StreamAPIStateMachine(session._handle_to_radio)
+        
+        # Константы (как в firmware)
+        SERIAL_CONNECTION_TIMEOUT_MS = 15 * 60 * 1000  # 15 минут (как в firmware SerialModule)
+        POLL_INTERVAL_RECENT_MS = 5  # 5ms если недавно были данные (как в firmware)
+        POLL_INTERVAL_IDLE_MS = 250  # 250ms если нет активности (как в firmware)
+        RECENT_RX_THRESHOLD_MS = 2000  # 2 секунды для определения "недавно" (как в firmware)
         
         try:
             last_position_check = 0
@@ -341,144 +350,187 @@ class TCPServer:
             KEEPALIVE_INTERVAL = 60.0  # секунд
             
             while self.running:
-                try:
-                    current_time = time.time()
-                    
-                    # Периодическая отправка позиции (как в firmware PositionModule::runOnce)
-                    # Проверяем каждые 5 секунд (как RUNONCE_INTERVAL в firmware)
-                    if current_time - last_position_check >= 5.0:
-                        last_position_check = current_time
+                current_time = time.time()
+                current_time_ms = int(current_time * 1000)
+                
+                # ВАЖНО: Сначала читаем из сокета, затем отправляем пакеты из MQTT
+                # (как в firmware StreamAPI::runOncePart - readStream() затем writeStream())
+                delay_ms = self._read_stream(session, state_machine, current_time_ms, RECENT_RX_THRESHOLD_MS)
+                
+                # Отправляем пакеты из MQTT (как в firmware writeStream())
+                self._write_stream(session)
+                
+                # Проверяем таймаут соединения (как в firmware checkConnectionTimeout())
+                if self._check_connection_timeout(session, state_machine, current_time_ms, SERIAL_CONNECTION_TIMEOUT_MS):
+                    break
+                
+                # Периодическая отправка позиции (как в firmware PositionModule::runOnce)
+                # Проверяем каждые 5 секунд (как RUNONCE_INTERVAL в firmware)
+                if current_time - last_position_check >= 5.0:
+                    last_position_check = current_time
+                    try:
                         session._run_position_broadcast()
-                    
-                    # Периодическая отправка телеметрии через TCP для поддержания активности соединения
-                    # (Android клиент закрывает соединение после 90 секунд неактивности)
-                    if current_time - last_keepalive_send >= KEEPALIVE_INTERVAL:
-                        last_keepalive_send = current_time
-                        try:
-                            session._send_telemetry_keepalive()
-                        except Exception as e:
-                            debug("TCP", f"[{session._log_prefix()}] Error sending keepalive: {e}")
-                    
-                    # Обрабатываем пакеты из MQTT для этой сессии
-                    if session.mqtt_client and hasattr(session.mqtt_client, 'to_client_queue'):
-                        try:
-                            while not session.mqtt_client.to_client_queue.empty():
-                                response = session.mqtt_client.to_client_queue.get_nowait()
-                                
-                                try:
-                                    from_radio_data = StreamAPI.remove_framing(response)
-                                    if from_radio_data:
-                                        from_radio = mesh_pb2.FromRadio()
-                                        from_radio.ParseFromString(from_radio_data)
-                                        if from_radio.HasField('packet'):
-                                            session._handle_mqtt_packet(from_radio.packet)
-                                except:
-                                    pass
-                                
-                                try:
-                                    session.client_socket.send(response)
-                                except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                                    # TCP соединение разорвано - это критическая ошибка
-                                    # НО: это ошибка TCP, а не MQTT, поэтому правильно закрыть TCP сессию
-                                    error("TCP", f"[{session._log_prefix()}] TCP connection broken while sending MQTT packet: {e}")
-                                    raise  # Пробрасываем, чтобы закрыть TCP соединение
-                                except Exception as e:
-                                    # Другие ошибки при отправке MQTT пакета (не разрыв TCP) - не критичны
-                                    debug("TCP", f"[{session._log_prefix()}] Error sending MQTT packet to TCP client: {e}")
-                                    # Продолжаем работу, не закрываем TCP соединение
-                        except (AttributeError, queue.Empty):
-                            pass
-                        except (BrokenPipeError, ConnectionResetError, OSError):
-                            # Ошибки разрыва TCP соединения - пробрасываем наверх
-                            raise
-                        except Exception as e:
-                            # Ошибки MQTT (не связанные с TCP) не должны закрывать TCP сессию
-                            debug("TCP", f"[{session._log_prefix()}] Error processing MQTT packets (MQTT issue, not TCP): {e}")
-                except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                    # Соединение разорвано - закрываем сессию
-                    error("TCP", f"[{session._log_prefix()}] Connection broken while sending: {e}")
-                    break
-                except Exception as e:
-                    error("TCP", f"[{session._log_prefix()}] Error sending packet to client: {e}")
-                    # Не критичные ошибки не должны закрывать соединение
+                    except Exception as e:
+                        debug("TCP", f"[{session._log_prefix()}] Error running position broadcast: {e}")
                 
-                try:
-                    data = session.client_socket.recv(4096)
-                    if not data:
-                        # Клиент закрыл соединение (recv вернул пустые данные)
-                        # Это нормальное поведение - клиент сам отключился
-                        debug("TCP", f"[{session._log_prefix()}] Client closed connection (recv returned empty)")
-                        break
-                    
-                    rx_buffer += data
-                    
-                    while len(rx_buffer) >= HEADER_LEN:
-                        if rx_buffer[0] != START1 or rx_buffer[1] != START2:
-                            rx_buffer = rx_buffer[1:]
-                            continue
-                        
-                        length = struct.unpack('>H', rx_buffer[2:4])[0]
-                        if length > MAX_TO_FROM_RADIO_SIZE:
-                            rx_buffer = rx_buffer[1:]
-                            continue
-                        
-                        if len(rx_buffer) < HEADER_LEN + length:
-                            break
-                        
-                        payload = rx_buffer[HEADER_LEN:HEADER_LEN + length]
-                        rx_buffer = rx_buffer[HEADER_LEN + length:]
-                        
-                        # Обработка пакета - ошибки здесь не должны закрывать TCP соединение
-                        # (как в firmware - ошибки парсинга просто игнорируются)
-                        try:
-                            session._handle_to_radio(payload)
-                        except Exception as e:
-                            # Ошибка обработки пакета - логируем, но не закрываем соединение
-                            # (как в firmware StreamAPI - ошибки парсинга просто сбрасывают rxPtr)
-                            debug("TCP", f"[{session._log_prefix()}] Error processing packet (ignoring): {e}")
-                            # Продолжаем работу
+                # Периодическая отправка телеметрии через TCP для поддержания активности соединения
+                # (Android клиент закрывает соединение после 90 секунд неактивности)
+                if current_time - last_keepalive_send >= KEEPALIVE_INTERVAL:
+                    last_keepalive_send = current_time
+                    try:
+                        session._send_telemetry_keepalive()
+                    except Exception as e:
+                        debug("TCP", f"[{session._log_prefix()}] Error sending keepalive: {e}")
                 
-                except socket.timeout:
-                    # Таймаут - это нормально, продолжаем работу
-                    continue
-                except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                    # Соединение разорвано - закрываем сессию
-                    error("TCP", f"[{session._log_prefix()}] Connection broken while reading: {e}")
-                    break
-                except Exception as e:
-                    # Критические ошибки при чтении (не парсинг) - закрываем соединение
-                    # Но это должно быть редко, так как _handle_to_radio уже ловит свои ошибки
-                    error("TCP", f"[{session._log_prefix()}] Critical error reading from client: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    break
+                # Адаптивный polling (как в firmware)
+                # Если delay_ms = 0, продолжаем немедленно, иначе ждем
+                if delay_ms > 0:
+                    # Используем select для неблокирующего ожидания (более эффективно чем time.sleep)
+                    ready, _, _ = select.select([session.client_socket], [], [], delay_ms / 1000.0)
+                    if not ready:
+                        # Таймаут - продолжаем цикл
+                        continue
         
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            # Соединение разорвано - закрываем сессию
+            error("TCP", f"[{session._log_prefix()}] Connection broken: {e}")
         except Exception as e:
             error("TCP", f"[{session._log_prefix()}] Error processing client: {e}")
             import traceback
             traceback.print_exc()
         finally:
-            # Логируем причину закрытия перед закрытием сокета
-            try:
-                # Проверяем, действительно ли сокет еще открыт
-                if session.client_socket:
-                    # Пытаемся получить информацию о состоянии сокета
-                    try:
-                        # Проверяем, не закрыт ли сокет уже
-                        session.client_socket.getpeername()
-                        debug("TCP", f"[{session._log_prefix()}] Closing session (socket still connected)")
-                    except OSError:
-                        debug("TCP", f"[{session._log_prefix()}] Closing session (socket already closed)")
-            except Exception as e:
-                debug("TCP", f"[{session._log_prefix()}] Error checking socket state: {e}")
-            
-            session.client_socket.close()
-            
-            # Удаляем сессию из активных
+            # Удаляем сессию из активных ПЕРЕД закрытием
             with self.sessions_lock:
                 if session.client_address in self.active_sessions:
                     del self.active_sessions[session.client_address]
             
+            # Закрываем сессию (это закроет сокет и остановит MQTT клиент)
             session.close()
             info("TCP", f"[{session._log_prefix()}] Client {session.client_address[0]}:{session.client_address[1]} disconnected")
+    
+    def _read_stream(self, session: TCPConnectionSession, state_machine: StreamAPIStateMachine, 
+                     current_time_ms: int, recent_threshold_ms: int) -> int:
+        """
+        Читает данные из потока (как в firmware StreamAPI::readStream)
+        
+        Returns:
+            Задержка до следующего вызова в миллисекундах (0 = немедленно, 5-250ms = адаптивная задержка)
+        """
+        # Константы polling (как в firmware)
+        POLL_INTERVAL_RECENT_MS = 5  # 5ms если недавно были данные
+        POLL_INTERVAL_IDLE_MS = 250  # 250ms если нет активности
+        
+        try:
+            # Пытаемся прочитать данные (неблокирующий режим)
+            data = session.client_socket.recv(4096)
+            
+            if not data:
+                # Клиент закрыл соединение (recv вернул пустые данные)
+                debug("TCP", f"[{session._log_prefix()}] Client closed connection (recv returned empty)")
+                raise ConnectionResetError("Client closed connection")
+            
+            # Обрабатываем данные через state machine (как в firmware handleRecStream)
+            state_machine.handle_rec_stream(data)
+            
+            # Были данные - предполагаем, что могут быть еще, возвращаем 0 для немедленного продолжения
+            return 0
+            
+        except BlockingIOError:
+            # Нет доступных данных (неблокирующий режим) - это нормально
+            # Адаптивный polling: если недавно были данные, проверяем часто, иначе редко
+            last_rx_ms = state_machine.get_last_rx_msec()
+            if last_rx_ms > 0:
+                time_since_last = current_time_ms - last_rx_ms
+                if time_since_last < recent_threshold_ms:
+                    # Недавно были данные - проверяем часто (5ms)
+                    return POLL_INTERVAL_RECENT_MS
+                else:
+                    # Давно не было данных - проверяем редко (250ms)
+                    return POLL_INTERVAL_IDLE_MS
+            else:
+                # Никогда не было данных - проверяем редко
+                return POLL_INTERVAL_IDLE_MS
+                
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            # Соединение разорвано - пробрасываем наверх
+            raise
+        except Exception as e:
+            # Другие ошибки - логируем, но не закрываем соединение
+            error("TCP", f"[{session._log_prefix()}] Error reading from stream: {e}")
+            return POLL_INTERVAL_IDLE_MS
+    
+    def _write_stream(self, session: TCPConnectionSession) -> None:
+        """
+        Отправляет пакеты из очереди (как в firmware StreamAPI::writeStream)
+        Отправляет все доступные пакеты за один вызов
+        """
+        if not session.mqtt_client or not hasattr(session.mqtt_client, 'to_client_queue'):
+            return
+        
+        try:
+            # Отправляем все доступные пакеты (как в firmware - do { ... } while (len))
+            packets_sent = 0
+            max_packets_per_iteration = 50  # Увеличиваем лимит, так как неблокирующий режим
+            
+            while not session.mqtt_client.to_client_queue.empty() and packets_sent < max_packets_per_iteration:
+                try:
+                    response = session.mqtt_client.to_client_queue.get_nowait()
+                    
+                    # Обрабатываем пакет перед отправкой (для обновления NodeDB)
+                    try:
+                        from_radio_data = StreamAPI.remove_framing(response)
+                        if from_radio_data:
+                            from_radio = mesh_pb2.FromRadio()
+                            from_radio.ParseFromString(from_radio_data)
+                            if from_radio.HasField('packet'):
+                                session._handle_mqtt_packet(from_radio.packet)
+                    except:
+                        pass
+                    
+                    # Отправляем пакет
+                    try:
+                        session.client_socket.send(response)
+                        packets_sent += 1
+                    except BlockingIOError:
+                        # Буфер отправки переполнен - это нормально, попробуем в следующий раз
+                        # Возвращаем пакет в очередь
+                        try:
+                            session.mqtt_client.to_client_queue.put_nowait(response)
+                        except queue.Full:
+                            warn("TCP", f"[{session._log_prefix()}] MQTT queue full, dropping packet")
+                        break
+                    except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                        # TCP соединение разорвано - пробрасываем наверх
+                        raise
+                        
+                except queue.Empty:
+                    break
+                    
+        except (AttributeError, queue.Empty):
+            pass
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # Ошибки разрыва TCP соединения - пробрасываем наверх
+            raise
+        except Exception as e:
+            # Ошибки MQTT (не связанные с TCP) не должны закрывать TCP сессию
+            debug("TCP", f"[{session._log_prefix()}] Error processing MQTT packets (MQTT issue, not TCP): {e}")
+    
+    def _check_connection_timeout(self, session: TCPConnectionSession, state_machine: StreamAPIStateMachine,
+                                   current_time_ms: int, timeout_ms: int) -> bool:
+        """
+        Проверяет таймаут соединения (как в firmware PhoneAPI::checkConnectionTimeout)
+        
+        Returns:
+            True если соединение должно быть закрыто из-за таймаута
+        """
+        last_rx_ms = state_machine.get_last_rx_msec()
+        
+        if last_rx_ms > 0:
+            time_since_last = current_time_ms - last_rx_ms
+            if time_since_last > timeout_ms:
+                # Таймаут соединения - не было данных слишком долго
+                info("TCP", f"[{session._log_prefix()}] Connection timeout ({time_since_last}ms > {timeout_ms}ms)")
+                return True
+        
+        return False
 
