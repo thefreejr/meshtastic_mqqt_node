@@ -691,6 +691,42 @@ class TCPConnectionSession:
             import traceback
             traceback.print_exc()
     
+    def _run_nodeinfo_broadcast(self) -> None:
+        """
+        Периодическая отправка NodeInfo в MQTT (как в firmware NodeInfoModule::runOnce)
+        Вызывается периодически для проверки необходимости отправки NodeInfo
+        """
+        if not self.mqtt_client or not self.mqtt_client.connected:
+            return
+        
+        try:
+            # Получаем интервал отправки из конфигурации (как в firmware)
+            # default_node_info_broadcast_secs = 3 * 60 * 60 (3 часа)
+            # min_node_info_broadcast_secs = 60 * 60 (1 час)
+            broadcast_secs = 0
+            if hasattr(self.config_storage, 'config') and hasattr(self.config_storage.config, 'device'):
+                if hasattr(self.config_storage.config.device, 'node_info_broadcast_secs'):
+                    broadcast_secs = self.config_storage.config.device.node_info_broadcast_secs
+            
+            if broadcast_secs == 0:
+                broadcast_secs = 3 * 60 * 60  # Дефолт: 3 часа (как в firmware default_node_info_broadcast_secs)
+            
+            # Минимальный интервал: 1 час (как в firmware min_node_info_broadcast_secs)
+            if broadcast_secs < 60 * 60:
+                broadcast_secs = 60 * 60
+            
+            current_time = time.time()
+            time_since_last = current_time - self.last_nodeinfo_published if self.last_nodeinfo_published > 0 else broadcast_secs + 1
+            
+            # Проверяем, прошло ли достаточно времени (как в firmware)
+            if self.last_nodeinfo_published == 0 or time_since_last >= broadcast_secs:
+                # Отправляем NodeInfo
+                self._publish_node_info_to_mqtt()
+                debug("NODEINFO", f"[{self._log_prefix()}] NodeInfo broadcast sent (interval={broadcast_secs}s)")
+            
+        except Exception as e:
+            debug("NODEINFO", f"[{self._log_prefix()}] Error in NodeInfo broadcast: {e}")
+    
     def _run_position_broadcast(self) -> None:
         """
         Периодическая отправка позиции (как в firmware PositionModule::runOnce)

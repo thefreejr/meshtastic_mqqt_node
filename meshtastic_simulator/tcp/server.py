@@ -372,6 +372,12 @@ class TCPServer:
                         session._run_position_broadcast()
                     except Exception as e:
                         debug("TCP", f"[{session._log_prefix()}] Error running position broadcast: {e}")
+                    
+                    # Периодическая отправка NodeInfo (как в firmware NodeInfoModule::runOnce)
+                    try:
+                        session._run_nodeinfo_broadcast()
+                    except Exception as e:
+                        debug("TCP", f"[{session._log_prefix()}] Error running NodeInfo broadcast: {e}")
                 
                 # Периодическая отправка телеметрии через TCP для поддержания активности соединения
                 # (Android клиент закрывает соединение после 90 секунд неактивности)

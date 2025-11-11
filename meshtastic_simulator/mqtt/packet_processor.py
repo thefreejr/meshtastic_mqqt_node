@@ -55,6 +55,8 @@ class MQTTPacketProcessor:
         self.MESHTASTIC_PKC_OVERHEAD = 12
         # Отслеживаем, когда мы последний раз отправляли NodeInfo каждому узлу (чтобы не отправлять слишком часто)
         self.last_nodeinfo_sent = {}  # {node_num: timestamp}
+        # Отслеживаем последние отправленные NodeInfo для проверки изменений (как в firmware: hasChanged)
+        self.last_sent_nodeinfo = {}  # {node_num: {'id': str, 'long_name': str, 'short_name': str, 'hw_model': int}}
     
     def process_mqtt_message(self, msg: Any, to_client_queue: Any) -> bool:
         """
@@ -575,113 +577,139 @@ class MQTTPacketProcessor:
                     
                     # ВАЖНО: Не отправляем NodeInfo для POSITION_APP пакетов (позиция обновляется, но NodeInfo не нужен)
                     if has_user_info and not is_position_packet:
-                        # Проверяем, что телеметрия установлена перед отправкой
-                        has_telemetry = hasattr(node_info, 'device_metrics') and node_info.HasField('device_metrics')
-                        if not has_telemetry:
-                            warn("MQTT", f"NodeInfo for !{packet_from:08X} has no device_metrics before sending to client!")
+                        # ВАЖНО: Проверяем, изменилась ли информация (как в firmware: hasChanged)
+                        # В firmware проверяется: user.id, user.long_name, user.short_name, user.hw_model
+                        has_changed = True
+                        if packet_from in self.last_sent_nodeinfo:
+                            last_info = self.last_sent_nodeinfo[packet_from]
+                            current_id = getattr(node_info.user, 'id', '')
+                            current_long_name = getattr(node_info.user, 'long_name', '')
+                            current_short_name = getattr(node_info.user, 'short_name', '')
+                            current_hw_model = getattr(node_info.user, 'hw_model', 0)
+                            
+                            has_changed = (
+                                current_id != last_info.get('id', '') or
+                                current_long_name != last_info.get('long_name', '') or
+                                current_short_name != last_info.get('short_name', '') or
+                                current_hw_model != last_info.get('hw_model', 0)
+                            )
                         
-                        # ВАЖНО: Создаем новый NodeInfo для FromRadio (как в firmware: fromRadioScratch.node_info = infoToSend)
-                        # В firmware используется прямое присваивание, а не CopyFrom
-                        from_radio_node_info = mesh_pb2.FromRadio()
-                        from_radio_node_info.node_info.CopyFrom(node_info)
-                        
-                        # ВАЖНО: В protobuf Python CopyFrom может не копировать вложенные сообщения правильно,
-                        # если флаг HasField не установлен. Убеждаемся, что телеметрия скопировалась
-                        if node_info.HasField('device_metrics'):
-                            # Копируем телеметрию явно (как в firmware: info.device_metrics = lite->device_metrics)
-                            if not from_radio_node_info.node_info.HasField('device_metrics'):
-                                from_radio_node_info.node_info.device_metrics.CopyFrom(node_info.device_metrics)
-                                debug("MQTT", f"Manually copied device_metrics to FromRadio.node_info for !{packet_from:08X}")
-                            else:
-                                # Проверяем, что значения совпадают
-                                if (getattr(from_radio_node_info.node_info.device_metrics, 'battery_level', 0) != 
-                                    getattr(node_info.device_metrics, 'battery_level', 0)):
+                        # Отправляем NodeInfo только если информация изменилась или это первый раз (как в firmware)
+                        if has_changed:
+                            # Обновляем последнюю отправленную информацию
+                            self.last_sent_nodeinfo[packet_from] = {
+                                'id': getattr(node_info.user, 'id', ''),
+                                'long_name': getattr(node_info.user, 'long_name', ''),
+                                'short_name': getattr(node_info.user, 'short_name', ''),
+                                'hw_model': getattr(node_info.user, 'hw_model', 0)
+                            }
+                            
+                            # Проверяем, что телеметрия установлена перед отправкой
+                            has_telemetry = hasattr(node_info, 'device_metrics') and node_info.HasField('device_metrics')
+                            if not has_telemetry:
+                                warn("MQTT", f"NodeInfo for !{packet_from:08X} has no device_metrics before sending to client!")
+                            
+                            # ВАЖНО: Создаем новый NodeInfo для FromRadio (как в firmware: fromRadioScratch.node_info = infoToSend)
+                            # В firmware используется прямое присваивание, а не CopyFrom
+                            from_radio_node_info = mesh_pb2.FromRadio()
+                            from_radio_node_info.node_info.CopyFrom(node_info)
+                            
+                            # ВАЖНО: В protobuf Python CopyFrom может не копировать вложенные сообщения правильно,
+                            # если флаг HasField не установлен. Убеждаемся, что телеметрия скопировалась
+                            if node_info.HasField('device_metrics'):
+                                # Копируем телеметрию явно (как в firmware: info.device_metrics = lite->device_metrics)
+                                if not from_radio_node_info.node_info.HasField('device_metrics'):
                                     from_radio_node_info.node_info.device_metrics.CopyFrom(node_info.device_metrics)
-                                    debug("MQTT", f"Updated device_metrics in FromRadio.node_info for !{packet_from:08X} (values didn't match)")
-                        else:
-                            warn("MQTT", f"NodeInfo for !{packet_from:08X} has no device_metrics before CopyFrom to FromRadio!")
-                        
-                        # Дополнительная проверка после копирования
-                        has_telemetry_after = hasattr(from_radio_node_info.node_info, 'device_metrics') and from_radio_node_info.node_info.HasField('device_metrics')
-                        if has_telemetry != has_telemetry_after:
-                            warn("MQTT", f"NodeInfo device_metrics lost during CopyFrom: before={has_telemetry}, after={has_telemetry_after}")
-                        
-                        # Логируем детали телеметрии перед отправкой
-                        if has_telemetry_after:
-                            battery = from_radio_node_info.node_info.device_metrics.battery_level if hasattr(from_radio_node_info.node_info.device_metrics, 'battery_level') else 'N/A'
-                            voltage = from_radio_node_info.node_info.device_metrics.voltage if hasattr(from_radio_node_info.node_info.device_metrics, 'voltage') else 'N/A'
-                            uptime = from_radio_node_info.node_info.device_metrics.uptime_seconds if hasattr(from_radio_node_info.node_info.device_metrics, 'uptime_seconds') else 'N/A'
-                            debug("MQTT", f"NodeInfo device_metrics before send: battery={battery}, voltage={voltage}, uptime={uptime}")
-                        
-                        # ВАЖНО: Проверяем, что телеметрия есть в сериализованном FromRadio
-                        # (как в firmware: fromRadioScratch.node_info = infoToSend)
-                        serialized_node_info = from_radio_node_info.SerializeToString()
-                        
-                        # Проверяем, что телеметрия включена в сериализованные данные
-                        # Десериализуем обратно для проверки
-                        try:
-                            test_from_radio = mesh_pb2.FromRadio()
-                            test_from_radio.ParseFromString(serialized_node_info)
-                            if test_from_radio.WhichOneof('payload_variant') == 'node_info':
-                                test_has_telemetry = test_from_radio.node_info.HasField('device_metrics')
-                                if test_has_telemetry:
-                                    test_battery = getattr(test_from_radio.node_info.device_metrics, 'battery_level', 0)
-                                    test_voltage = getattr(test_from_radio.node_info.device_metrics, 'voltage', 0.0)
-                                    debug("MQTT", f"✅ Serialized FromRadio.node_info has device_metrics: battery={test_battery}, voltage={test_voltage}")
+                                    debug("MQTT", f"Manually copied device_metrics to FromRadio.node_info for !{packet_from:08X}")
                                 else:
-                                    warn("MQTT", f"❌ Serialized FromRadio.node_info has NO device_metrics after serialization!")
-                        except Exception as e:
-                            debug("MQTT", f"Error checking serialized FromRadio: {e}")
-                        
-                        framed_node_info = StreamAPI.add_framing(serialized_node_info)
-                        # Используем put_nowait для избежания блокировки
-                        try:
-                            to_client_queue.put_nowait(framed_node_info)
-                        except queue.Full:
-                            warn("MQTT", f"Client queue is full, dropping NodeInfo packet")
-                        short_name = node_info.user.short_name if hasattr(node_info.user, 'short_name') and node_info.user.short_name else 'N/A'
-                        debug("MQTT", f"Sent NodeInfo to client for node !{packet_from:08X} ({short_name}, telemetry={has_telemetry_after}, battery={battery if has_telemetry_after else 'N/A'})")
-                        
-                        # ВАЖНО: В firmware телеметрия также отправляется отдельным пакетом TELEMETRY_APP клиенту
-                        # (как в DeviceTelemetryModule::sendTelemetry с phoneOnly=true)
-                        # Отправляем телеметрию отдельным пакетом, если она есть
-                        if has_telemetry_after and node_info.HasField('device_metrics'):
+                                    # Проверяем, что значения совпадают
+                                    if (getattr(from_radio_node_info.node_info.device_metrics, 'battery_level', 0) != 
+                                        getattr(node_info.device_metrics, 'battery_level', 0)):
+                                        from_radio_node_info.node_info.device_metrics.CopyFrom(node_info.device_metrics)
+                                        debug("MQTT", f"Updated device_metrics in FromRadio.node_info for !{packet_from:08X} (values didn't match)")
+                            else:
+                                warn("MQTT", f"NodeInfo for !{packet_from:08X} has no device_metrics before CopyFrom to FromRadio!")
+                            
+                            # Дополнительная проверка после копирования
+                            has_telemetry_after = hasattr(from_radio_node_info.node_info, 'device_metrics') and from_radio_node_info.node_info.HasField('device_metrics')
+                            if has_telemetry != has_telemetry_after:
+                                warn("MQTT", f"NodeInfo device_metrics lost during CopyFrom: before={has_telemetry}, after={has_telemetry_after}")
+                            
+                            # Логируем детали телеметрии перед отправкой
+                            if has_telemetry_after:
+                                battery = from_radio_node_info.node_info.device_metrics.battery_level if hasattr(from_radio_node_info.node_info.device_metrics, 'battery_level') else 'N/A'
+                                voltage = from_radio_node_info.node_info.device_metrics.voltage if hasattr(from_radio_node_info.node_info.device_metrics, 'voltage') else 'N/A'
+                                uptime = from_radio_node_info.node_info.device_metrics.uptime_seconds if hasattr(from_radio_node_info.node_info.device_metrics, 'uptime_seconds') else 'N/A'
+                                debug("MQTT", f"NodeInfo device_metrics before send: battery={battery}, voltage={voltage}, uptime={uptime}")
+                            
+                            # ВАЖНО: Проверяем, что телеметрия есть в сериализованном FromRadio
+                            # (как в firmware: fromRadioScratch.node_info = infoToSend)
+                            serialized_node_info = from_radio_node_info.SerializeToString()
+                            
+                            # Проверяем, что телеметрия включена в сериализованные данные
+                            # Десериализуем обратно для проверки
                             try:
-                                # portnums_pb2 уже импортирован на уровне модуля, импортируем только telemetry_pb2
-                                from meshtastic.protobuf import telemetry_pb2
-                                if telemetry_pb2 and portnums_pb2:
-                                    # Создаем Telemetry пакет (как в firmware DeviceTelemetryModule)
-                                    telemetry = telemetry_pb2.Telemetry()
-                                    telemetry.time = int(time.time())
-                                    telemetry.device_metrics.CopyFrom(node_info.device_metrics)
-                                    
-                                    # Создаем MeshPacket с Telemetry payload (portnum=TELEMETRY_APP)
-                                    telemetry_packet = mesh_pb2.MeshPacket()
-                                    telemetry_packet.id = random.randint(1, 0xFFFFFFFF)
-                                    telemetry_packet.to = 0  # To phone (0 = local)
-                                    setattr(telemetry_packet, 'from', packet_from)
-                                    telemetry_packet.channel = 0
-                                    telemetry_packet.decoded.portnum = portnums_pb2.PortNum.TELEMETRY_APP
-                                    telemetry_packet.decoded.payload = telemetry.SerializeToString()
-                                    telemetry_packet.want_ack = False
-                                    
-                                    # Создаем FromRadio с MeshPacket
-                                    from_radio_telemetry = mesh_pb2.FromRadio()
-                                    from_radio_telemetry.packet.CopyFrom(telemetry_packet)
-                                    
-                                    # Отправляем клиенту
-                                    serialized_telemetry = from_radio_telemetry.SerializeToString()
-                                    framed_telemetry = StreamAPI.add_framing(serialized_telemetry)
-                                    # Используем put_nowait для избежания блокировки
-                                    try:
-                                        to_client_queue.put_nowait(framed_telemetry)
-                                    except queue.Full:
-                                        warn("MQTT", f"Client queue is full, dropping Telemetry packet")
-                                    debug("MQTT", f"Sent TELEMETRY_APP packet to client for node !{packet_from:08X} (battery={node_info.device_metrics.battery_level})")
+                                test_from_radio = mesh_pb2.FromRadio()
+                                test_from_radio.ParseFromString(serialized_node_info)
+                                if test_from_radio.WhichOneof('payload_variant') == 'node_info':
+                                    test_has_telemetry = test_from_radio.node_info.HasField('device_metrics')
+                                    if test_has_telemetry:
+                                        test_battery = getattr(test_from_radio.node_info.device_metrics, 'battery_level', 0)
+                                        test_voltage = getattr(test_from_radio.node_info.device_metrics, 'voltage', 0.0)
+                                        debug("MQTT", f"✅ Serialized FromRadio.node_info has device_metrics: battery={test_battery}, voltage={test_voltage}")
+                                    else:
+                                        warn("MQTT", f"❌ Serialized FromRadio.node_info has NO device_metrics after serialization!")
                             except Exception as e:
-                                debug("MQTT", f"Error sending TELEMETRY_APP packet: {e}")
-                                import traceback
-                                traceback.print_exc()
+                                debug("MQTT", f"Error checking serialized FromRadio: {e}")
+                            
+                            framed_node_info = StreamAPI.add_framing(serialized_node_info)
+                            # Используем put_nowait для избежания блокировки
+                            try:
+                                to_client_queue.put_nowait(framed_node_info)
+                                debug("MQTT", f"Sent NodeInfo to client for !{packet_from:08X} (info changed)")
+                            except Exception as e:
+                                debug("MQTT", f"Error sending NodeInfo to client queue: {e}")
+                            
+                            # ВАЖНО: В firmware телеметрия также отправляется отдельным пакетом TELEMETRY_APP клиенту
+                            # (как в DeviceTelemetryModule::sendTelemetry с phoneOnly=true)
+                            # Отправляем телеметрию отдельным пакетом, если она есть
+                            if has_telemetry_after and node_info.HasField('device_metrics'):
+                                try:
+                                    # portnums_pb2 уже импортирован на уровне модуля, импортируем только telemetry_pb2
+                                    from meshtastic.protobuf import telemetry_pb2
+                                    if telemetry_pb2 and portnums_pb2:
+                                        # Создаем Telemetry пакет (как в firmware DeviceTelemetryModule)
+                                        telemetry = telemetry_pb2.Telemetry()
+                                        telemetry.time = int(time.time())
+                                        telemetry.device_metrics.CopyFrom(node_info.device_metrics)
+                                        
+                                        # Создаем MeshPacket с Telemetry payload (portnum=TELEMETRY_APP)
+                                        telemetry_packet = mesh_pb2.MeshPacket()
+                                        telemetry_packet.id = random.randint(1, 0xFFFFFFFF)
+                                        telemetry_packet.to = 0  # To phone (0 = local)
+                                        setattr(telemetry_packet, 'from', packet_from)
+                                        telemetry_packet.channel = 0
+                                        telemetry_packet.decoded.portnum = portnums_pb2.PortNum.TELEMETRY_APP
+                                        telemetry_packet.decoded.payload = telemetry.SerializeToString()
+                                        telemetry_packet.want_ack = False
+                                        
+                                        # Создаем FromRadio с MeshPacket
+                                        from_radio_telemetry = mesh_pb2.FromRadio()
+                                        from_radio_telemetry.packet.CopyFrom(telemetry_packet)
+                                        
+                                        # Отправляем клиенту
+                                        serialized_telemetry = from_radio_telemetry.SerializeToString()
+                                        framed_telemetry = StreamAPI.add_framing(serialized_telemetry)
+                                        # Используем put_nowait для избежания блокировки
+                                        try:
+                                            to_client_queue.put_nowait(framed_telemetry)
+                                        except queue.Full:
+                                            warn("MQTT", f"Client queue is full, dropping Telemetry packet")
+                                        debug("MQTT", f"Sent TELEMETRY_APP packet to client for node !{packet_from:08X} (battery={node_info.device_metrics.battery_level})")
+                                except Exception as e:
+                                    debug("MQTT", f"Error sending TELEMETRY_APP packet: {e}")
+                                    import traceback
+                                    traceback.print_exc()
                     
                     # Отправляем NodeInfo получателя отправителю, если нужно (проверка была сделана ДО обновления NodeDB)
                     # ВАЖНО: Отправляем даже если информация о пользователе уже есть, но была обновлена только что
@@ -1019,12 +1047,12 @@ class MQTTPacketProcessor:
             # portnums_pb2 уже импортирован на уровне модуля
             
             # Проверяем, не отправляли ли мы NodeInfo этому узлу недавно (чтобы не спамить)
-            # В firmware это контролируется через throttling, но мы делаем простую проверку
-            # Уменьшаем интервал до 10 секунд, чтобы ноды видели друг друга при отправке сообщений
+            # В firmware это контролируется через throttling (60 секунд для shorterTimeout, 5 минут для обычного)
+            # Используем 60 секунд (как shorterTimeout в firmware)
             current_time = time.time()
             last_sent = self.last_nodeinfo_sent.get(sender_node_num, 0)
-            if current_time - last_sent < 10:  # Не отправляем чаще чем раз в 10 секунд (было 60)
-                debug("MQTT", f"[{receiver_session._log_prefix()}] Skipping NodeInfo send to !{sender_node_num:08X} (sent {current_time - last_sent:.1f}s ago)")
+            if current_time - last_sent < 60:  # Не отправляем чаще чем раз в 60 секунд (как shorterTimeout в firmware)
+                debug("MQTT", f"[{receiver_session._log_prefix()}] Skipping NodeInfo send to !{sender_node_num:08X} (sent {current_time - last_sent:.1f}s ago, <60s)")
                 return
             
             # Создаем User пакет с информацией о владельце получателя
