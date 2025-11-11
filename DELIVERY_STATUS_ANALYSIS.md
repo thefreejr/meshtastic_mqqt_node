@@ -155,12 +155,63 @@ ACK должен иметь:
 
 ---
 
+## Исправления
+
+### 1. Проверка currentReply (response был отправлен)
+
+**Проблема:** ACK отправлялся даже если модуль уже отправил response (Admin пакет с `want_response=true`).
+
+**Исправление:** Добавлена проверка `response_sent` - если response был отправлен, ACK не отправляется (как в firmware `MeshModule::currentReply`).
+
+```python
+# ВАЖНО: Проверяем, был ли отправлен response (как в firmware MeshModule::currentReply)
+response_sent = False
+if PacketHandler.is_admin_packet(packet):
+    response_sent = self._handle_admin_message(packet)
+
+# ВАЖНО: В firmware ACK не отправляется, если модуль уже отправил response (currentReply)
+if not response_sent:  # Если response не был отправлен
+    if PacketHandler.should_send_ack(packet):
+        # Отправляем ACK
+```
+
+### 2. Проверка request_id и reply_id
+
+**Проблема:** ACK отправлялся для всех пакетов с `want_ack=true`, включая пакеты с `request_id` или `reply_id`.
+
+**Исправление:** Добавлена проверка для пакетов с `request_id` или `reply_id` (как в firmware):
+
+```python
+# В firmware ACK отправляется для пакетов БЕЗ request_id и reply_id
+# Или для прямых пакетов (hop_start == hop_limit)
+has_request_id = hasattr(packet.decoded, 'request_id') and packet.decoded.request_id != 0
+has_reply_id = hasattr(packet.decoded, 'reply_id') and packet.decoded.reply_id != 0
+
+if not has_request_id and not has_reply_id:
+    should_send_ack = True
+else:
+    # Для пакетов с request_id/reply_id проверяем, прямой ли это пакет
+    hop_start = getattr(packet, 'hop_start', 0)
+    hop_limit = getattr(packet, 'hop_limit', 0)
+    is_direct = (hop_start > 0 and hop_start == hop_limit)
+    if is_direct:
+        should_send_ack = True  # Прямой пакет - отправляем 0-hop ACK
+```
+
+### 3. Детальное логирование
+
+Добавлено логирование для диагностики:
+- `ack_from`, `ack_to`, `original_from`, `original_to`
+- Предсказание статуса: `(will be RECEIVED)` или `(will be DELIVERED)`
+- Причина, почему ACK не отправляется (response был отправлен или should_send_ack вернул False)
+
 ## Следующие шаги
 
 1. ✅ Добавлено детальное логирование для диагностики
-2. Проверить логи - отправляется ли ACK для прямых сообщений?
-3. Проверить поле `from` в ACK пакетах - правильно ли оно установлено?
-4. Проверить, приходит ли ACK от получателя или от промежуточного узла
+2. ✅ Исправлена логика отправки ACK (проверка currentReply)
+3. ✅ Добавлена проверка request_id и reply_id
+4. Проверить логи - отправляется ли ACK для прямых сообщений?
+5. Проверить поле `from` в ACK пакетах - правильно ли оно установлено?
 
 ## Выводы
 

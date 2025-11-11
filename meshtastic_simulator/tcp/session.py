@@ -880,10 +880,12 @@ class TCPConnectionSession:
             packet_copy_for_client = mesh_pb2.MeshPacket()
             packet_copy_for_client.CopyFrom(packet)
             
-            # Используем PacketHandler для проверки Admin пакета
+            # ВАЖНО: Проверяем, был ли отправлен response (как в firmware MeshModule::currentReply)
+            # Если response был отправлен, ACK не отправляется (избежание дублирования)
+            response_sent = False
             if PacketHandler.is_admin_packet(packet):
                 debug("TCP", f"[{self._log_prefix()}] AdminMessage detected, forwarding to handler (want_response={getattr(packet.decoded, 'want_response', False)})")
-                self._handle_admin_message(packet)
+                response_sent = self._handle_admin_message(packet)
             
             # Устанавливаем поле from на наш node_num перед отправкой в MQTT
             # (как в firmware Router.cpp: p->from = getFrom(p))
@@ -978,14 +980,42 @@ class TCPConnectionSession:
                         self._send_from_radio(from_radio)
                         info("POSITION", f"[{self._log_prefix()}] Sent position reply (request_id={packet.id})")
             
-            # Используем PacketHandler для проверки необходимости отправки ACK
-            if PacketHandler.should_send_ack(packet):
+            # ВАЖНО: В firmware ACK не отправляется, если модуль уже отправил response (currentReply)
+            # (как в firmware ReliableRouter::sniffReceived: if (!MeshModule::currentReply))
+            # Также проверяем пакеты с request_id и reply_id (как в firmware: else if (!p->decoded.request_id && !p->decoded.reply_id))
+            should_send_ack = False
+            if not response_sent:  # Если response не был отправлен
+                if PacketHandler.should_send_ack(packet):
+                    # Дополнительная проверка для пакетов с request_id или reply_id (как в firmware)
+                    has_request_id = hasattr(packet.decoded, 'request_id') and packet.decoded.request_id != 0
+                    has_reply_id = hasattr(packet.decoded, 'reply_id') and packet.decoded.reply_id != 0
+                    
+                    # В firmware ACK отправляется для пакетов БЕЗ request_id и reply_id
+                    # Или для прямых пакетов (hop_start == hop_limit)
+                    # Для простоты, отправляем ACK если нет request_id и reply_id
+                    if not has_request_id and not has_reply_id:
+                        should_send_ack = True
+                    else:
+                        # Для пакетов с request_id/reply_id проверяем, прямой ли это пакет
+                        hop_start = getattr(packet, 'hop_start', 0)
+                        hop_limit = getattr(packet, 'hop_limit', 0)
+                        is_direct = (hop_start > 0 and hop_start == hop_limit)
+                        if is_direct:
+                            should_send_ack = True
+                            debug("ACK", f"[{self._log_prefix()}] Direct packet with request_id/reply_id, sending 0-hop ACK")
+                        else:
+                            debug("ACK", f"[{self._log_prefix()}] Packet {packet.id} has request_id={has_request_id} or reply_id={has_reply_id}, skipping ACK (not direct)")
+            
+            if should_send_ack:
                 portnum_name = packet.decoded.portnum if hasattr(packet.decoded, 'portnum') else 'N/A'
                 debug("ACK", f"[{self._log_prefix()}] Sending ACK for packet {packet.id} (portnum={portnum_name}, from={packet_from:08X})")
                 self._send_ack(packet, channel_index)
             else:
                 # Логируем, если ACK не отправляется (для диагностики)
-                if hasattr(packet.decoded, 'portnum') and packet.decoded.portnum == portnums_pb2.PortNum.POSITION_APP:
+                if want_ack:
+                    reason = "response was sent" if response_sent else "should_send_ack returned False"
+                    debug("ACK", f"[{self._log_prefix()}] Packet {packet.id} with want_ack=True: ACK not sent ({reason})")
+                elif hasattr(packet.decoded, 'portnum') and packet.decoded.portnum == portnums_pb2.PortNum.POSITION_APP:
                     debug("ACK", f"[{self._log_prefix()}] POSITION_APP packet {packet.id}: want_ack={want_ack}, ACK not sent (normal)")
             
             # ВАЖНО: Отправляем пакет обратно клиенту через FromRadio (как в firmware MeshService::handleFromRadio)
@@ -1218,8 +1248,13 @@ class TCPConnectionSession:
             import traceback
             traceback.print_exc()
     
-    def _handle_admin_message(self, packet: mesh_pb2.MeshPacket) -> None:
-        """Обрабатывает AdminMessage из MeshPacket"""
+    def _handle_admin_message(self, packet: mesh_pb2.MeshPacket) -> bool:
+        """
+        Обрабатывает AdminMessage из MeshPacket
+        
+        Returns:
+            True если был отправлен response, False иначе
+        """
         try:
             admin_msg = admin_pb2.AdminMessage()
             admin_msg.ParseFromString(packet.decoded.payload)
@@ -1375,8 +1410,10 @@ class TCPConnectionSession:
                     from_radio.packet.CopyFrom(reply_packet)
                     self._send_from_radio(from_radio)
                     info("ADMIN", f"[{self._log_prefix()}] Sent get_channel_response for channel {ch_index} (request_id={packet.id})")
+                    return True  # Response был отправлен
                 else:
                     warn("ADMIN", f"[{self._log_prefix()}] Invalid channel index: {ch_index} (requested: {requested_index}, max: {MAX_NUM_CHANNELS-1})")
+                    return False
             
             elif admin_msg.HasField('get_config_request'):
                 config_type = admin_msg.get_config_request
@@ -1407,6 +1444,7 @@ class TCPConnectionSession:
                 except:
                     config_type_name = str(config_type)
                 info("ADMIN", f"[{self._log_prefix()}] Sent get_config_response for {config_type_name} (request_id={packet.id})")
+                return True  # Response был отправлен
             
             elif admin_msg.HasField('get_module_config_request'):
                 module_config_type = admin_msg.get_module_config_request
@@ -1414,12 +1452,12 @@ class TCPConnectionSession:
                 
                 if not getattr(packet.decoded, 'want_response', False):
                     warn("ADMIN", f"[{self._log_prefix()}] get_module_config_request without want_response (module_config_type={module_config_type})")
-                    return
+                    return False
                 
                 module_config_response = self.config_storage.get_module_config(module_config_type)
                 if module_config_response is None:
                     warn("ADMIN", f"[{self._log_prefix()}] Unknown module configuration type: {module_config_type}")
-                    return
+                    return False
                 
                 admin_response = admin_pb2.AdminMessage()
                 admin_response.get_module_config_response.CopyFrom(module_config_response)
@@ -1437,13 +1475,14 @@ class TCPConnectionSession:
                 except:
                     module_config_type_name = str(module_config_type)
                 info("ADMIN", f"[{self._log_prefix()}] Sent get_module_config_response for {module_config_type_name} (request_id={packet.id})")
+                return True  # Response был отправлен
             
             elif admin_msg.HasField('get_canned_message_module_messages_request'):
                 debug("ADMIN", f"[{self._log_prefix()}] get_canned_message_module_messages_request")
                 
                 if not getattr(packet.decoded, 'want_response', False):
                     warn("ADMIN", f"[{self._log_prefix()}] get_canned_message_module_messages_request without want_response")
-                    return
+                    return False
                 
                 messages = self.canned_messages
                 
@@ -1457,6 +1496,7 @@ class TCPConnectionSession:
                 from_radio.packet.CopyFrom(reply_packet)
                 self._send_from_radio(from_radio)
                 info("ADMIN", f"[{self._log_prefix()}] Sent get_canned_message_module_messages_response (request_id={packet.id})")
+                return True  # Response был отправлен
             
             elif admin_msg.HasField('set_canned_message_module_messages'):
                 messages = admin_msg.set_canned_message_module_messages
@@ -1475,7 +1515,7 @@ class TCPConnectionSession:
                 
                 if not getattr(packet.decoded, 'want_response', False):
                     warn("ADMIN", f"[{self._log_prefix()}] get_owner_request without want_response")
-                    return
+                    return False
                 
                 admin_response = admin_pb2.AdminMessage()
                 admin_response.get_owner_response.CopyFrom(self.owner)
@@ -1487,13 +1527,14 @@ class TCPConnectionSession:
                 from_radio.packet.CopyFrom(reply_packet)
                 self._send_from_radio(from_radio)
                 info("ADMIN", f"[{self._log_prefix()}] Sent get_owner_response (request_id={packet.id})")
+                return True  # Response был отправлен
             
             elif admin_msg.HasField('get_device_metadata_request'):
                 debug("ADMIN", f"[{self._log_prefix()}] get_device_metadata_request")
                 
                 if not getattr(packet.decoded, 'want_response', False):
                     warn("ADMIN", f"[{self._log_prefix()}] get_device_metadata_request without want_response")
-                    return
+                    return False
                 
                 device_metadata = mesh_pb2.DeviceMetadata()
                 # ВАЖНО: Убеждаемся, что версия прошивки всегда установлена и не пустая
@@ -1539,6 +1580,7 @@ class TCPConnectionSession:
                 from_radio.packet.CopyFrom(reply_packet)
                 self._send_from_radio(from_radio)
                 info("ADMIN", f"[{self._log_prefix()}] Sent get_device_metadata_response (request_id={packet.id})")
+                return True  # Response был отправлен
             
             elif admin_msg.HasField('set_time_only'):
                 timestamp = admin_msg.set_time_only
@@ -1555,6 +1597,10 @@ class TCPConnectionSession:
             error("ADMIN", f"[{self._log_prefix()}] Error processing AdminMessage: {e}")
             import traceback
             traceback.print_exc()
+            return False
+        
+        # Если ни одно из условий не выполнено, response не был отправлен
+        return False
     
     def _send_config(self, config_nonce: int) -> None:
         """Отправляет конфигурацию клиенту"""
