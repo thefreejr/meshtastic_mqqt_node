@@ -1,0 +1,30 @@
+# Индивидуальная конфигурация бота (пример)
+# Скопируйте этот файл и переименуйте в bot_<your_bot_id>.yaml
+
+bot_id: "example"  # Уникальный ID бота (имя файла без расширения)
+
+# Переопределение дефолтных настроек
+bot:
+  user:
+    long_name: "Example Bot"
+    short_name: "EXBOT"
+  
+  webhook:
+    url: "https://example.com/webhook/meshtastic"  # Замените на ваш webhook URL
+    enabled: true
+    timeout: 10
+    headers:
+      Authorization: "Bearer token123"  # Опционально: заголовки для аутентификации
+  
+  # Генерация node_id (если не указан, генерируется автоматически из bot_id)
+  node_id: null  # null = сгенерировать из bot_id или случайно
+  
+  # MQTT настройки (если нужно переопределить)
+  mqtt:
+    address: null  # null = использовать из project.yaml
+    port: null
+    username: null
+    password: null
+    root: null
+
+

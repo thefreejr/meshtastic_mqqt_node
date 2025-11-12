@@ -1,0 +1,52 @@
+# Дефолтные настройки бота
+bot:
+  # MQTT настройки (если не указаны, используются из project.yaml)
+  mqtt:
+    address: null  # null = использовать из project.yaml
+    port: null
+    username: null
+    password: null
+    root: null
+  
+  # Информация о пользователе
+  user:
+    long_name: "Meshtatsic Bot"
+    short_name: "BOT"
+    hw_model: "PORTDUINO"
+  
+  # Телеметрия устройства
+  device_metrics:
+    battery_level: 101  # 101 = powered
+    voltage: 5.0
+    channel_utilization: 0.0
+    air_util_tx: 0.0
+  
+  # Версия прошивки
+  firmware_version: "2.7.0"
+  
+  # Fallback node number (если не указан, генерируется из node_id)
+  fallback_node_num: null
+  
+  # Webhook настройки
+  webhook:
+    enabled: true
+    url: null  # Обязательно указать в индивидуальном файле
+    timeout: 5  # Таймаут запроса в секундах
+    retry_count: 3  # Количество попыток при ошибке
+    retry_delay: 1  # Задержка между попытками в секундах
+    headers: {}  # Дополнительные HTTP заголовки
+    verify_ssl: true  # Проверять SSL сертификат
+  
+  # Каналы (если не указаны, используются из node_defaults.json)
+  channels: null  # null = использовать из node_defaults.json
+  
+  # Автоматическая отправка NodeInfo при подключении
+  auto_send_nodeinfo: true
+  
+  # Автоматическая отправка телеметрии при подключении
+  auto_send_telemetry: true
+  
+  # Автоматическая отправка позиции при подключении
+  auto_send_position: false
+
+

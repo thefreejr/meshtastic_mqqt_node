@@ -23,6 +23,8 @@ from meshtastic_simulator.config import (
 )
 from meshtastic_simulator.utils.logger import set_log_level, set_log_categories, set_log_file, LogLevel
 from meshtastic_simulator.tcp import TCPServer
+from meshtastic_simulator.bots import BotManager
+from meshtastic_simulator.api.server import APIServer
 
 
 def get_local_ip() -> str:
@@ -77,6 +79,14 @@ def main():
                        help='Уровень логирования (по умолчанию: из config.py)')
     parser.add_argument('--log-categories', type=str, default=None,
                        help='Категории логов (через запятую, например: TCP,MQTT,ADMIN). По умолчанию: все категории')
+    parser.add_argument('--api-port', type=int, default=8080,
+                       help='API порт (по умолчанию: 8080)')
+    parser.add_argument('--api-host', default='0.0.0.0',
+                       help='API хост (по умолчанию: 0.0.0.0)')
+    parser.add_argument('--no-api', action='store_true',
+                       help='Не запускать API сервер')
+    parser.add_argument('--no-bots', action='store_true',
+                       help='Не загружать ботов')
     
     args = parser.parse_args()
     
@@ -125,6 +135,30 @@ def main():
     tcp_thread = threading.Thread(target=tcp_server.start, daemon=True)
     tcp_thread.start()
     
+    # Создаем менеджер ботов
+    bot_manager = None
+    if not args.no_bots:
+        bot_manager = BotManager()
+        loaded_bots = bot_manager.load_bots_from_config()
+        if loaded_bots:
+            print(f"\n✓ Loaded {len(loaded_bots)} bots: {', '.join(loaded_bots)}")
+        else:
+            print("\n✓ No bots configured")
+    
+    # Создаем API сервер
+    api_server = None
+    api_thread = None
+    if not args.no_api:
+        try:
+            api_server = APIServer(bot_manager=bot_manager, host=args.api_host, port=args.api_port)
+            api_thread = threading.Thread(target=api_server.start, daemon=True)
+            api_thread.start()
+            print(f"\n✓ API server started on http://{args.api_host}:{args.api_port}")
+            print(f"  API docs: http://{args.api_host}:{args.api_port}/docs")
+        except Exception as e:
+            print(f"\n⚠ Failed to start API server: {e}")
+            print("  Install dependencies: pip install fastapi uvicorn[standard]")
+    
     print("\n✓ Server started")
     print(f"  Local connection: meshtastic --host localhost:{args.tcp_port}")
     if local_ip != '127.0.0.1':
@@ -137,7 +171,14 @@ def main():
     except KeyboardInterrupt:
         print("\n\n⚠ Stopping...")
         try:
+            # Останавливаем ботов
+            if bot_manager:
+                bot_manager.stop_all()
+                print("✓ Bots stopped")
+            
+            # Останавливаем TCP сервер
             tcp_server.stop()
+            
             # Даем время на корректное завершение всех потоков
             time.sleep(0.5)
         except Exception as e:
